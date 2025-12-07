@@ -30,7 +30,7 @@ class Config:
         # Metals
         'XAUUSDm', 'XAGUSDm',  # Gold and Silver
         # Indices
-        'US30m', 'USTECm', 'US500m', 'UK100m', 'DE30m', 'FRA40m', 'JP225m'
+        'US30m', 'USTECm', 'US500m', 'UK100m', 'DE30m'
         #Crypto
         'BTCUSDm'
     ]

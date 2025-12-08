@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <!-- CDN links for React, Tailwind, etc. -->
+</head>
+<body>
+    <div id="root"></div>
+    <script>
+        // Storage polyfill
+        window.storage = {...};
+    </script>
+    <script type="text/babel">
+        // PASTE THE ENTIRE REACT COMPONENT HERE
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<TradingJournal />);
+    </script>
+</body>
+</html>

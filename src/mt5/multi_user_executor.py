@@ -1,362 +1,508 @@
 """
-Multi-User MT5 Auto-Executor
-Executes trades on each user's own MT5 accounts
+Multi-User MT5 Account Manager
+Allows users to add their own MT5 accounts for auto-execution
+Secure credential storage with encryption
 """
 
-import MetaTrader5 as mt5
-from typing import Dict, Optional, List
-from datetime import datetime
+import os
+import json
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
 import asyncio
+from typing import Dict, List, Optional
+from datetime import datetime
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 
-class MultiUserMT5Executor:
-    """Handles trade execution across multiple user accounts"""
+class MT5AccountManager:
+    """Manages multiple user MT5 accounts with secure storage"""
     
-    def __init__(self, account_manager, config):
-        self.account_manager = account_manager
+    def __init__(self, config):
         self.config = config
-        self.active_connections = {}  # {account_id: connection_info}
-        self.user_positions = {}  # {user_id: {signal_id: [tickets]}}
+        self.accounts_file = 'data/user_accounts.encrypted'
+        self.key_file = 'data/.encryption_key'
+        self.cipher = None
+        self.user_accounts = {}  # {user_id: [accounts]}
         
-    async def execute_signal_for_all_users(self, signal: Dict) -> Dict:
-        """
-        Execute signal on all enabled user accounts
-        Returns: {user_id: {account_id: ticket}}
-        """
-        results = {}
+        # Initialize encryption
+        self._initialize_encryption()
         
-        # Get all enabled accounts across all users
-        all_enabled = self.account_manager.get_all_enabled_accounts()
-        
-        if not all_enabled:
-            logger.info("No enabled accounts for execution")
-            return results
-        
-        # Execute on each user's accounts
-        for user_id, accounts in all_enabled.items():
-            user_results = {}
+        # Load existing accounts
+        self._load_accounts()
+    
+    def _initialize_encryption(self):
+        """Initialize encryption key"""
+        try:
+            if os.path.exists(self.key_file):
+                # Load existing key
+                with open(self.key_file, 'rb') as f:
+                    key = f.read()
+            else:
+                # Generate new key
+                key = Fernet.generate_key()
+                os.makedirs(os.path.dirname(self.key_file), exist_ok=True)
+                with open(self.key_file, 'wb') as f:
+                    f.write(key)
+                # Set file permissions to read-only for owner
+                os.chmod(self.key_file, 0o600)
             
-            for account in accounts:
-                try:
-                    # Execute trade
-                    ticket = await self._execute_on_account(user_id, account, signal)
-                    
-                    if ticket:
-                        user_results[account['account_id']] = ticket
-                        
-                        # Track position
-                        if user_id not in self.user_positions:
-                            self.user_positions[user_id] = {}
-                        if signal['signal_id'] not in self.user_positions[user_id]:
-                            self.user_positions[user_id][signal['signal_id']] = []
-                        
-                        self.user_positions[user_id][signal['signal_id']].append({
-                            'account_id': account['account_id'],
-                            'ticket': ticket,
-                            'account_nickname': account['nickname']
-                        })
-                        
-                        # Increment trade count
-                        self.account_manager.increment_trade_count(user_id, account['account_id'])
-                        
-                        logger.info(f"Trade executed for user {user_id} on {account['nickname']}: Ticket {ticket}")
+            self.cipher = Fernet(key)
+            logger.info("Encryption initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing encryption: {e}")
+            raise
+    
+    def _encrypt_data(self, data: str) -> bytes:
+        """Encrypt sensitive data"""
+        return self.cipher.encrypt(data.encode())
+    
+    def _decrypt_data(self, encrypted_data: bytes) -> str:
+        """Decrypt sensitive data"""
+        return self.cipher.decrypt(encrypted_data).decode()
+    
+    def _load_accounts(self):
+        """Load user accounts from encrypted file"""
+        try:
+            if os.path.exists(self.accounts_file):
+                with open(self.accounts_file, 'rb') as f:
+                    encrypted_data = f.read()
                 
-                except Exception as e:
-                    logger.error(f"Error executing on account {account['account_id']}: {e}")
-                    user_results[account['account_id']] = None
+                if encrypted_data:
+                    decrypted_data = self._decrypt_data(encrypted_data)
+                    self.user_accounts = json.loads(decrypted_data)
+                    logger.info(f"Loaded accounts for {len(self.user_accounts)} users")
+            else:
+                self.user_accounts = {}
+                logger.info("No existing accounts file - starting fresh")
+                
+        except Exception as e:
+            logger.error(f"Error loading accounts: {e}")
+            self.user_accounts = {}
+    
+    def _save_accounts(self):
+        """Save user accounts to encrypted file"""
+        try:
+            # Convert to JSON
+            json_data = json.dumps(self.user_accounts, indent=2)
             
-            if user_results:
-                results[user_id] = user_results
+            # Encrypt
+            encrypted_data = self._encrypt_data(json_data)
+            
+            # Save to file
+            os.makedirs(os.path.dirname(self.accounts_file), exist_ok=True)
+            with open(self.accounts_file, 'wb') as f:
+                f.write(encrypted_data)
+            
+            # Set file permissions
+            os.chmod(self.accounts_file, 0o600)
+            
+            logger.info("User accounts saved securely")
+            
+        except Exception as e:
+            logger.error(f"Error saving accounts: {e}")
+    
+    def can_add_account(self, user_id: str) -> tuple:
+        """Check if user can add more accounts"""
+        is_admin = user_id == self.config.TELEGRAM_ADMIN_ID
         
-        return results
+        if is_admin:
+            return True, "Admin - unlimited accounts"
+        
+        current_count = len(self.user_accounts.get(user_id, []))
+        max_accounts = 5
+        
+        if current_count >= max_accounts:
+            return False, f"Maximum {max_accounts} accounts per user"
+        
+        return True, f"Can add {max_accounts - current_count} more account(s)"
     
-    async def _execute_on_account(self, user_id: str, account: Dict, signal: Dict) -> Optional[int]:
-        """Execute trade on a specific user account"""
+    def add_account(self, user_id: str, account_data: Dict) -> tuple:
+        """Add MT5 account for user"""
         try:
-            # Get account credentials
-            credentials = self.account_manager.get_account_credentials(
-                user_id, 
-                account['account_id']
-            )
+            # Check if user can add more accounts
+            can_add, message = self.can_add_account(user_id)
+            if not can_add:
+                return False, message
             
-            if not credentials:
-                logger.error(f"Could not get credentials for account {account['account_id']}")
-                return None
+            # Validate account data
+            required_fields = ['login', 'password', 'server', 'broker', 'nickname']
+            missing = [f for f in required_fields if f not in account_data]
             
-            # Connect to this specific account
-            if not await self._connect_to_account(credentials, account['account_id']):
-                logger.error(f"Failed to connect to account {account['login']}")
-                return None
+            if missing:
+                return False, f"Missing fields: {', '.join(missing)}"
             
-            # Get account balance
-            account_info = mt5.account_info()
-            if not account_info:
-                logger.error(f"Could not get account info for {account['login']}")
-                return None
+            # Initialize user's account list if needed
+            if user_id not in self.user_accounts:
+                self.user_accounts[user_id] = []
             
-            balance = account_info.balance
+            # Check for duplicate login
+            for acc in self.user_accounts[user_id]:
+                if acc['login'] == account_data['login']:
+                    return False, f"Account {account_data['login']} already added"
             
-            # Calculate lot size based on this account's balance
-            lot_size = await self._calculate_lot_size(
-                signal['symbol'],
-                self.config.MAX_RISK_PERCENT,
-                signal['sl_pips'],
-                balance
-            )
+            # Generate unique account ID
+            account_id = f"{user_id}_{account_data['login']}_{int(datetime.now().timestamp())}"
             
-            # Execute based on order type
-            entry_type = signal['entry_type']
-            direction = signal['direction']
-            
-            if entry_type == 'MARKET':
-                ticket = await self._place_market_order(
-                    signal['symbol'],
-                    direction,
-                    lot_size,
-                    signal['stop_loss'],
-                    signal['take_profit'],
-                    account['nickname']
-                )
-            elif entry_type in ['BUY_LIMIT', 'SELL_LIMIT']:
-                ticket = await self._place_limit_order(
-                    signal['symbol'],
-                    direction,
-                    signal['entry_price'],
-                    lot_size,
-                    signal['stop_loss'],
-                    signal['take_profit'],
-                    account['nickname']
-                )
-            elif entry_type in ['BUY_STOP', 'SELL_STOP']:
-                ticket = await self._place_stop_order(
-                    signal['symbol'],
-                    direction,
-                    signal['entry_price'],
-                    lot_size,
-                    signal['stop_loss'],
-                    signal['take_profit'],
-                    account['nickname']
-                )
-            else:
-                logger.error(f"Unknown order type: {entry_type}")
-                return None
-            
-            return ticket
-            
-        except Exception as e:
-            logger.error(f"Error executing on account: {e}", exc_info=True)
-            return None
-        finally:
-            # Always shutdown MT5 connection after trade
-            try:
-                mt5.shutdown()
-            except:
-                pass
-    
-    async def _connect_to_account(self, credentials: Dict, account_id: str) -> bool:
-        """Connect to a specific MT5 account"""
-        try:
-            # Initialize MT5
-            if not mt5.initialize():
-                logger.error(f"MT5 initialization failed for account {account_id}")
-                return False
-            
-            # Login to account
-            authorized = mt5.login(
-                login=credentials['login'],
-                password=credentials['password'],
-                server=credentials['server'],
-                timeout=60000
-            )
-            
-            if not authorized:
-                error = mt5.last_error()
-                logger.error(f"MT5 login failed for {credentials['login']}: {error}")
-                mt5.shutdown()
-                return False
-            
-            logger.info(f"Connected to MT5 account: {credentials['login']}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error connecting to account: {e}")
-            return False
-    
-    async def _calculate_lot_size(self, symbol: str, risk_percent: float, 
-                                   stop_loss_pips: float, account_balance: float) -> float:
-        """Calculate lot size based on account balance and risk"""
-        try:
-            symbol_info = mt5.symbol_info(symbol)
-            
-            if not symbol_info:
-                logger.warning(f"Could not get symbol info for {symbol}, using default 0.01")
-                return 0.01
-            
-            # Risk amount
-            risk_amount = account_balance * (risk_percent / 100)
-            
-            # Get point value
-            point = symbol_info.point
-            contract_size = symbol_info.trade_contract_size
-            
-            # Calculate pip value
-            if 'JPY' in symbol:
-                pip_value = (point * 100) * contract_size
-            else:
-                pip_value = point * contract_size
-            
-            # Calculate lot size
-            lot_size = risk_amount / (stop_loss_pips * pip_value)
-            
-            # Round to volume step
-            volume_step = symbol_info.volume_step
-            lot_size = round(lot_size / volume_step) * volume_step
-            
-            # Ensure within limits
-            lot_size = max(symbol_info.volume_min, 
-                          min(lot_size, symbol_info.volume_max))
-            
-            logger.info(f"Calculated lot size: {lot_size} (Risk: {risk_percent}%, Balance: ${account_balance:.2f})")
-            
-            return lot_size
-            
-        except Exception as e:
-            logger.error(f"Error calculating lot size: {e}")
-            return 0.01
-    
-    async def _place_market_order(self, symbol: str, direction: str, lot_size: float,
-                                   sl: float, tp: float, account_name: str) -> Optional[int]:
-        """Place market order"""
-        try:
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return None
-            
-            order_type = mt5.ORDER_TYPE_BUY if direction == 'BUY' else mt5.ORDER_TYPE_SELL
-            price = symbol_info.ask if direction == 'BUY' else symbol_info.bid
-            
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": lot_size,
-                "type": order_type,
-                "price": price,
-                "sl": sl,
-                "tp": tp,
-                "deviation": 20,
-                "magic": 234000,
-                "comment": f"NIXIE_{account_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
+            # Create account entry
+            account = {
+                'account_id': account_id,
+                'login': account_data['login'],
+                'password': account_data['password'],  # Will be encrypted when saved
+                'server': account_data['server'],
+                'broker': account_data['broker'],
+                'nickname': account_data['nickname'],
+                'enabled': True,  # Auto-execution enabled by default
+                'added_date': datetime.now().isoformat(),
+                'last_used': None,
+                'total_trades': 0
             }
             
-            result = mt5.order_send(request)
+            # Add to user's accounts
+            self.user_accounts[user_id].append(account)
             
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Market order failed on {account_name}: {result.comment}")
-                return None
+            # Save to encrypted file
+            self._save_accounts()
             
-            return result.order
+            logger.info(f"Account added for user {user_id}: {account['nickname']} ({account['login']})")
+            
+            return True, f"Account '{account['nickname']}' added successfully!"
             
         except Exception as e:
-            logger.error(f"Error placing market order: {e}")
-            return None
+            logger.error(f"Error adding account: {e}")
+            return False, f"Error: {str(e)}"
     
-    async def _place_limit_order(self, symbol: str, direction: str, entry: float,
-                                  lot_size: float, sl: float, tp: float, 
-                                  account_name: str) -> Optional[int]:
-        """Place limit order"""
+    def remove_account(self, user_id: str, account_id: str) -> tuple:
+        """Remove MT5 account"""
         try:
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return None
+            if user_id not in self.user_accounts:
+                return False, "No accounts found"
             
-            order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == 'BUY' else mt5.ORDER_TYPE_SELL_LIMIT
+            # Find and remove account
+            accounts = self.user_accounts[user_id]
+            for i, acc in enumerate(accounts):
+                if acc['account_id'] == account_id:
+                    removed_nickname = acc['nickname']
+                    del accounts[i]
+                    
+                    # Remove user entry if no accounts left
+                    if not accounts:
+                        del self.user_accounts[user_id]
+                    
+                    self._save_accounts()
+                    
+                    logger.info(f"Account removed for user {user_id}: {removed_nickname}")
+                    return True, f"Account '{removed_nickname}' removed successfully"
             
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": lot_size,
-                "type": order_type,
-                "price": entry,
-                "sl": sl,
-                "tp": tp,
-                "deviation": 20,
-                "magic": 234000,
-                "comment": f"NIXIE_{account_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN,
-            }
-            
-            result = mt5.order_send(request)
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Limit order failed on {account_name}: {result.comment}")
-                return None
-            
-            return result.order
+            return False, "Account not found"
             
         except Exception as e:
-            logger.error(f"Error placing limit order: {e}")
-            return None
+            logger.error(f"Error removing account: {e}")
+            return False, f"Error: {str(e)}"
     
-    async def _place_stop_order(self, symbol: str, direction: str, entry: float,
-                                 lot_size: float, sl: float, tp: float,
-                                 account_name: str) -> Optional[int]:
-        """Place stop order"""
+    def toggle_account(self, user_id: str, account_id: str) -> tuple:
+        """Toggle auto-execution for an account"""
         try:
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return None
+            if user_id not in self.user_accounts:
+                return False, "No accounts found"
             
-            order_type = mt5.ORDER_TYPE_BUY_STOP if direction == 'BUY' else mt5.ORDER_TYPE_SELL_STOP
+            for acc in self.user_accounts[user_id]:
+                if acc['account_id'] == account_id:
+                    acc['enabled'] = not acc['enabled']
+                    self._save_accounts()
+                    
+                    status = "enabled" if acc['enabled'] else "disabled"
+                    logger.info(f"Account {acc['nickname']} {status} for user {user_id}")
+                    
+                    return True, f"Auto-execution {status} for '{acc['nickname']}'"
             
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": lot_size,
-                "type": order_type,
-                "price": entry,
-                "sl": sl,
-                "tp": tp,
-                "deviation": 20,
-                "magic": 234000,
-                "comment": f"NIXIE_{account_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN,
-            }
-            
-            result = mt5.order_send(request)
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Stop order failed on {account_name}: {result.comment}")
-                return None
-            
-            return result.order
+            return False, "Account not found"
             
         except Exception as e:
-            logger.error(f"Error placing stop order: {e}")
-            return None
+            logger.error(f"Error toggling account: {e}")
+            return False, f"Error: {str(e)}"
     
-    def get_user_positions(self, user_id: str, signal_id: str) -> List[Dict]:
-        """Get positions for a user's signal"""
-        if user_id not in self.user_positions:
+    def get_user_accounts(self, user_id: str) -> List[Dict]:
+        """Get all accounts for a user"""
+        accounts = self.user_accounts.get(user_id, [])
+        
+        # Return sanitized version (without passwords)
+        return [{
+            'account_id': acc['account_id'],
+            'login': acc['login'],
+            'server': acc['server'],
+            'broker': acc['broker'],
+            'nickname': acc['nickname'],
+            'enabled': acc['enabled'],
+            'added_date': acc['added_date'],
+            'total_trades': acc['total_trades']
+        } for acc in accounts]
+    
+    def get_account_credentials(self, user_id: str, account_id: str) -> Optional[Dict]:
+        """Get full account credentials (including password) for execution"""
+        if user_id not in self.user_accounts:
+            return None
+        
+        for acc in self.user_accounts[user_id]:
+            if acc['account_id'] == account_id and acc['enabled']:
+                return {
+                    'login': int(acc['login']),
+                    'password': acc['password'],
+                    'server': acc['server']
+                }
+        
+        return None
+    
+    def get_enabled_accounts(self, user_id: str) -> List[Dict]:
+        """Get all enabled accounts for a user"""
+        if user_id not in self.user_accounts:
             return []
         
-        return self.user_positions[user_id].get(signal_id, [])
+        return [acc for acc in self.user_accounts[user_id] if acc['enabled']]
     
-    def get_total_executions(self) -> Dict:
-        """Get statistics on executions"""
-        total_users = len(self.user_positions)
-        total_positions = sum(
-            len(signals) 
-            for signals in self.user_positions.values()
+    def increment_trade_count(self, user_id: str, account_id: str):
+        """Increment trade count for an account"""
+        try:
+            if user_id in self.user_accounts:
+                for acc in self.user_accounts[user_id]:
+                    if acc['account_id'] == account_id:
+                        acc['total_trades'] += 1
+                        acc['last_used'] = datetime.now().isoformat()
+                        self._save_accounts()
+                        break
+        except Exception as e:
+            logger.error(f"Error incrementing trade count: {e}")
+    
+    def get_all_enabled_accounts(self) -> Dict[str, List[Dict]]:
+        """Get all enabled accounts across all users"""
+        enabled_accounts = {}
+        
+        for user_id, accounts in self.user_accounts.items():
+            enabled = [acc for acc in accounts if acc['enabled']]
+            if enabled:
+                enabled_accounts[user_id] = enabled
+        
+        return enabled_accounts
+    
+    def get_total_accounts(self) -> Dict:
+        """Get statistics about accounts"""
+        total_users = len(self.user_accounts)
+        total_accounts = sum(len(accs) for accs in self.user_accounts.values())
+        enabled_accounts = sum(
+            len([a for a in accs if a['enabled']]) 
+            for accs in self.user_accounts.values()
         )
         
         return {
-            'users_with_positions': total_users,
-            'total_positions': total_positions
+            'total_users': total_users,
+            'total_accounts': total_accounts,
+            'enabled_accounts': enabled_accounts,
+            'disabled_accounts': total_accounts - enabled_accounts
         }
+
+
+class UserAccountSetupHandler:
+    """Handles interactive account setup via Telegram"""
+    
+    def __init__(self):
+        self.pending_setups = {}  # {user_id: {step: str, data: {}}}
+    
+    def start_setup(self, user_id: str) -> str:
+        """Start account setup process"""
+        self.pending_setups[user_id] = {
+            'step': 'broker',
+            'data': {}
+        }
+        
+        return """
+<b>🏦 ADD MT5 ACCOUNT - STEP 1/6</b>
+
+<b>Select Your Broker:</b>
+Please type your broker name.
+
+<b>Popular Brokers:</b>
+• Exness
+• IC Markets
+• Pepperstone
+• FTMO
+• XM
+• HFM (HotForex)
+• Fusion Markets
+• Other (type your broker name)
+
+<b>Example:</b> <code>Exness</code>
+
+Type your broker name or send /cancel to stop.
+"""
+    
+    def process_input(self, user_id: str, input_text: str) -> tuple:
+        """
+        Process user input for account setup
+        Returns: (completed: bool, message: str, data: dict or None)
+        """
+        if user_id not in self.pending_setups:
+            return False, "No setup in progress. Use /addaccount to start.", None
+        
+        setup = self.pending_setups[user_id]
+        step = setup['step']
+        data = setup['data']
+        
+        # Process based on current step
+        if step == 'broker':
+            data['broker'] = input_text
+            setup['step'] = 'server'
+            
+            message = f"""
+<b>🌐 ADD MT5 ACCOUNT - STEP 2/6</b>
+
+<b>Broker:</b> {data['broker']}
+
+<b>Enter MT5 Server Name:</b>
+This is usually shown when you log into MT5.
+
+<b>Examples:</b>
+• Exness: <code>Exness-MT5Trial9</code>
+• IC Markets: <code>ICMarketsSC-Demo</code>
+• FTMO: <code>FTMO-Demo</code>
+
+<b>Where to find it:</b>
+Open MT5 → Tools → Options → Server tab
+
+Type the exact server name or /cancel to stop.
+"""
+            return False, message, None
+        
+        elif step == 'server':
+            data['server'] = input_text
+            setup['step'] = 'login'
+            
+            message = f"""
+<b>🔢 ADD MT5 ACCOUNT - STEP 3/6</b>
+
+<b>Broker:</b> {data['broker']}
+<b>Server:</b> {data['server']}
+
+<b>Enter Your MT5 Account Number (Login):</b>
+This is your account number shown in MT5.
+
+<b>Example:</b> <code>12345678</code>
+
+⚠️ Make sure you enter the correct account number.
+
+Type your account number or /cancel to stop.
+"""
+            return False, message, None
+        
+        elif step == 'login':
+            # Validate login is numeric
+            if not input_text.isdigit():
+                return False, "❌ Invalid account number. Please enter numbers only.", None
+            
+            data['login'] = input_text
+            setup['step'] = 'password'
+            
+            message = f"""
+<b>🔐 ADD MT5 ACCOUNT - STEP 4/6</b>
+
+<b>Broker:</b> {data['broker']}
+<b>Server:</b> {data['server']}
+<b>Login:</b> {data['login']}
+
+<b>Enter Your MT5 Password:</b>
+This is the password you use to log into MT5.
+
+🔒 <b>Security Notes:</b>
+• Your password is encrypted and stored securely
+• Only you can access this account
+• Password is never shown in plain text
+• You can delete the account anytime
+
+⚠️ <b>IMPORTANT:</b> Make sure you trust this bot before entering your password.
+
+Type your password or /cancel to stop.
+"""
+            return False, message, None
+        
+        elif step == 'password':
+            data['password'] = input_text
+            setup['step'] = 'nickname'
+            
+            # Don't show password in confirmation
+            message = f"""
+<b>📝 ADD MT5 ACCOUNT - STEP 5/6</b>
+
+<b>Broker:</b> {data['broker']}
+<b>Server:</b> {data['server']}
+<b>Login:</b> {data['login']}
+<b>Password:</b> ********** (stored securely)
+
+<b>Give This Account a Nickname:</b>
+Choose a friendly name to identify this account.
+
+<b>Examples:</b>
+• My Demo Account
+• Main Trading
+• Scalping Account
+• FTMO Challenge
+
+Type a nickname (max 30 characters) or /cancel to stop.
+"""
+            return False, message, None
+        
+        elif step == 'nickname':
+            if len(input_text) > 30:
+                return False, "❌ Nickname too long. Please use 30 characters or less.", None
+            
+            data['nickname'] = input_text
+            setup['step'] = 'confirmation'
+            
+            message = f"""
+<b>✅ ADD MT5 ACCOUNT - STEP 6/6 - CONFIRMATION</b>
+
+<b>Please verify your account details:</b>
+
+<b>Nickname:</b> {data['nickname']}
+<b>Broker:</b> {data['broker']}
+<b>Server:</b> {data['server']}
+<b>Login:</b> {data['login']}
+<b>Password:</b> **********
+
+<b>Auto-Execution:</b> Will be ENABLED by default
+(You can disable it later with /myaccounts)
+
+<b>Commands:</b>
+• Type <code>confirm</code> to add this account
+• Type <code>cancel</code> to discard and start over
+
+Is everything correct?
+"""
+            return False, message, None
+        
+        elif step == 'confirmation':
+            if input_text.lower() == 'confirm':
+                # Setup complete - return data
+                account_data = data.copy()
+                del self.pending_setups[user_id]
+                return True, "Account setup completed!", account_data
+            elif input_text.lower() == 'cancel':
+                del self.pending_setups[user_id]
+                return True, "Account setup cancelled.", None
+            else:
+                return False, "Please type 'confirm' or 'cancel'.", None
+        
+        return False, "Unknown step. Please use /addaccount to start over.", None
+    
+    def cancel_setup(self, user_id: str):
+        """Cancel ongoing setup"""
+        if user_id in self.pending_setups:
+            del self.pending_setups[user_id]
+            return True
+        return False
+    
+    def has_pending_setup(self, user_id: str) -> bool:
+        """Check if user has pending setup"""
+        return user_id in self.pending_setups

@@ -2,8 +2,10 @@
 Enhanced Telegram Bot Handler with User Account Management
 """
 
+import os
 import asyncio
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from src.telegram.pdf_generator import PDFGenerator
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
@@ -26,6 +28,7 @@ class TelegramBotHandler:
         self.app = None
         self.bot = None
         self.db = Database(config.DB_PATH)
+        self.pdf_generator = PDFGenerator()
         
         # Account management
         self.account_manager = MT5AccountManager(config)
@@ -50,6 +53,8 @@ class TelegramBotHandler:
                 
                 self.app = Application.builder().token(self.bot_token).request(request).build()
                 self.bot = self.app.bot
+                self.app.add_handler(CommandHandler("downloadsignals", self.cmd_download_signals))
+                self.app.add_handler(CommandHandler("downloadclosed", self.cmd_download_closed))
                 
                 # Basic commands
                 self.app.add_handler(CommandHandler("start", self.cmd_start))
@@ -398,6 +403,94 @@ Your account is now active and will automatically execute signals.
             
         except Exception as e:
             logger.error(f"Error refreshing accounts list: {e}")
+            
+            
+    
+async def cmd_download_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download signals log as PDF (Admin only)"""
+    try:
+        user_id = str(update.effective_user.id)
+        
+        # Check if admin
+        if user_id != self.config.TELEGRAM_ADMIN_ID:
+            await update.message.reply_text(
+                "⛔ This command is only available to the bot administrator.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        await update.message.reply_text("📄 Generating PDF report... Please wait.")
+        
+        # Generate PDF
+        pdf_file = f"data/signals_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        success = self.pdf_generator.generate_signals_pdf(
+            'data/signals_log.csv', 
+            pdf_file
+        )
+        
+        if success and os.path.exists(pdf_file):
+            # Send PDF
+            with open(pdf_file, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"Nixie_Signals_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    caption="📊 <b>Signals Report</b>\n\nAll generated signals with outcomes.",
+                    parse_mode=ParseMode.HTML
+                )
+            
+            # Clean up
+            os.remove(pdf_file)
+            logger.info(f"Admin {user_id} downloaded signals PDF")
+        else:
+            await update.message.reply_text(
+                "❌ Failed to generate PDF. Check if signals exist.",
+                parse_mode=ParseMode.HTML
+            )
+        
+    except Exception as e:
+        logger.error(f"Error in download signals command: {e}")
+        await update.message.reply_text("❌ An error occurred generating the PDF.")
+
+async def cmd_download_closed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download closed trades as PDF (Admin only)"""
+    try:
+        user_id = str(update.effective_user.id)
+        
+        if user_id != self.config.TELEGRAM_ADMIN_ID:
+            await update.message.reply_text(
+                "⛔ This command is only available to the bot administrator.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        await update.message.reply_text("📄 Generating closed trades PDF... Please wait.")
+        
+        pdf_file = f"data/closed_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        success = self.pdf_generator.generate_closed_trades_pdf(
+            'data/closed_trades.csv',
+            pdf_file
+        )
+        
+        if success and os.path.exists(pdf_file):
+            with open(pdf_file, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"Nixie_Closed_Trades_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    caption="📈 <b>Closed Trades Report</b>\n\nAll completed trades with outcomes.",
+                    parse_mode=ParseMode.HTML
+                )
+            
+            os.remove(pdf_file)
+            logger.info(f"Admin {user_id} downloaded closed trades PDF")
+        else:
+            await update.message.reply_text(
+                "❌ Failed to generate PDF. Check if closed trades exist.",
+                parse_mode=ParseMode.HTML
+            )
+        
+    except Exception as e:
+        logger.error(f"Error in download closed command: {e}")
+        await update.message.reply_text("❌ An error occurred generating the PDF.")
     
     # ==================== EXISTING COMMANDS (UPDATED) ====================
     

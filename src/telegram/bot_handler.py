@@ -1,24 +1,23 @@
 """
-Telegram Bot Handler
-Manages user subscriptions and broadcasts signals/updates
-FIXED: Added retry logic and better timeout handling
+Enhanced Telegram Bot Handler with User Account Management
 """
 
 import asyncio
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from datetime import datetime
 from typing import Dict, List
 from src.utils.logger import setup_logger
 from src.utils.database import Database
+from src.core.user_account_manager import MT5AccountManager, UserAccountSetupHandler
 
 logger = setup_logger(__name__)
 
 
 class TelegramBotHandler:
-    """Handles Telegram bot operations"""
+    """Enhanced Telegram bot with user account management"""
     
     def __init__(self, config, main_bot):
         self.config = config
@@ -28,16 +27,19 @@ class TelegramBotHandler:
         self.bot = None
         self.db = Database(config.DB_PATH)
         
+        # Account management
+        self.account_manager = MT5AccountManager(config)
+        self.setup_handler = UserAccountSetupHandler()
+        
     async def initialize(self):
-        """Initialize Telegram bot with retry logic"""
+        """Initialize Telegram bot"""
         max_retries = 3
         retry_delay = 5
         
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(f"Attempting to initialize Telegram bot (attempt {attempt}/{max_retries})...")
+                logger.info(f"Initializing Telegram bot (attempt {attempt}/{max_retries})...")
                 
-                # Create custom request with longer timeout
                 request = HTTPXRequest(
                     connection_pool_size=8,
                     connect_timeout=30.0,
@@ -46,19 +48,32 @@ class TelegramBotHandler:
                     pool_timeout=30.0
                 )
                 
-                # Create application with custom request
                 self.app = Application.builder().token(self.bot_token).request(request).build()
                 self.bot = self.app.bot
                 
-                # Add command handlers
+                # Basic commands
                 self.app.add_handler(CommandHandler("start", self.cmd_start))
                 self.app.add_handler(CommandHandler("subscribe", self.cmd_subscribe))
                 self.app.add_handler(CommandHandler("unsubscribe", self.cmd_unsubscribe))
                 self.app.add_handler(CommandHandler("status", self.cmd_status))
                 self.app.add_handler(CommandHandler("stats", self.cmd_stats))
                 self.app.add_handler(CommandHandler("help", self.cmd_help))
+                self.app.add_handler(CommandHandler("autoexec", self.cmd_autoexec))
                 
-                # Start bot with timeout
+                # Account management commands (NEW)
+                self.app.add_handler(CommandHandler("addaccount", self.cmd_add_account))
+                self.app.add_handler(CommandHandler("myaccounts", self.cmd_my_accounts))
+                self.app.add_handler(CommandHandler("cancel", self.cmd_cancel))
+                
+                # Message handler for account setup
+                self.app.add_handler(MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, 
+                    self.handle_setup_message
+                ))
+                
+                # Callback query handler for inline buttons
+                self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+                
                 await asyncio.wait_for(self.app.initialize(), timeout=30)
                 await asyncio.wait_for(self.app.start(), timeout=30)
                 await asyncio.wait_for(self.app.updater.start_polling(drop_pending_updates=True), timeout=30)
@@ -67,18 +82,14 @@ class TelegramBotHandler:
                 return True
                 
             except asyncio.TimeoutError:
-                logger.error(f"Telegram initialization timeout on attempt {attempt}/{max_retries}")
+                logger.error(f"Telegram timeout on attempt {attempt}/{max_retries}")
                 if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                 else:
-                    logger.error("All Telegram initialization attempts failed")
-                    raise Exception("Telegram API connection timeout - check your internet connection or firewall")
-                    
+                    raise Exception("Telegram API connection timeout")
             except Exception as e:
-                logger.error(f"Error initializing Telegram bot on attempt {attempt}: {e}", exc_info=True)
+                logger.error(f"Telegram init error on attempt {attempt}: {e}")
                 if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                 else:
                     raise
@@ -90,54 +101,336 @@ class TelegramBotHandler:
                 await self.app.updater.stop()
                 await self.app.stop()
                 await self.app.shutdown()
-            
             logger.info("Telegram bot shut down")
+        except Exception as e:
+            logger.error(f"Error shutting down Telegram: {e}")
+    
+    # ==================== ACCOUNT MANAGEMENT COMMANDS ====================
+    
+    async def cmd_add_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /addaccount command"""
+        try:
+            user_id = str(update.effective_user.id)
+            
+            # Check if user already has a pending setup
+            if self.setup_handler.has_pending_setup(user_id):
+                await update.message.reply_text(
+                    "You already have an account setup in progress.\nUse /cancel to stop it.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Check if user can add more accounts
+            can_add, message = self.account_manager.can_add_account(user_id)
+            
+            if not can_add:
+                await update.message.reply_text(
+                    f"❌ {message}\n\nUse /myaccounts to manage existing accounts.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Start setup process
+            welcome_msg = self.setup_handler.start_setup(user_id)
+            await update.message.reply_text(welcome_msg, parse_mode=ParseMode.HTML)
+            
+            logger.info(f"User {user_id} started account setup")
             
         except Exception as e:
-            logger.error(f"Error shutting down Telegram bot: {e}")
+            logger.error(f"Error in addaccount command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
+    
+    async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cancel command"""
+        try:
+            user_id = str(update.effective_user.id)
+            
+            if self.setup_handler.cancel_setup(user_id):
+                await update.message.reply_text(
+                    "✅ Account setup cancelled.\n\nUse /addaccount to start over.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await update.message.reply_text(
+                    "No setup in progress.",
+                    parse_mode=ParseMode.HTML
+                )
+            
+        except Exception as e:
+            logger.error(f"Error in cancel command: {e}")
+    
+    async def handle_setup_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle messages during account setup"""
+        try:
+            user_id = str(update.effective_user.id)
+            
+            # Check if user has pending setup
+            if not self.setup_handler.has_pending_setup(user_id):
+                return  # Not in setup mode, ignore
+            
+            input_text = update.message.text.strip()
+            
+            # Process the input
+            completed, message, account_data = self.setup_handler.process_input(user_id, input_text)
+            
+            # Send response
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+            
+            # If setup completed and confirmed
+            if completed and account_data:
+                # Add account to manager
+                success, result_msg = self.account_manager.add_account(user_id, account_data)
+                
+                if success:
+                    final_msg = f"""
+<b>🎉 ACCOUNT ADDED SUCCESSFULLY!</b>
+
+<b>Nickname:</b> {account_data['nickname']}
+<b>Login:</b> {account_data['login']}
+<b>Auto-Execution:</b> ENABLED ✅
+
+Your account is now active and will automatically execute signals.
+
+<b>What's Next?</b>
+• Signals will be auto-executed on this account
+• You'll receive notifications for all trades
+• Use /myaccounts to manage this account
+
+<b>Security:</b>
+• Your credentials are encrypted
+• Only you can access this account
+• You can remove it anytime
+
+<i>Happy trading! 🚀</i>
+"""
+                    await update.message.reply_text(final_msg, parse_mode=ParseMode.HTML)
+                    logger.info(f"User {user_id} successfully added account: {account_data['nickname']}")
+                else:
+                    await update.message.reply_text(
+                        f"❌ Failed to add account: {result_msg}\n\nPlease try again with /addaccount",
+                        parse_mode=ParseMode.HTML
+                    )
+            
+        except Exception as e:
+            logger.error(f"Error handling setup message: {e}")
+            await update.message.reply_text(
+                "An error occurred. Use /cancel to stop and try again.",
+                parse_mode=ParseMode.HTML
+            )
+    
+    async def cmd_my_accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /myaccounts command - show user's accounts"""
+        try:
+            user_id = str(update.effective_user.id)
+            
+            # Get user's accounts
+            accounts = self.account_manager.get_user_accounts(user_id)
+            
+            if not accounts:
+                can_add, msg = self.account_manager.can_add_account(user_id)
+                await update.message.reply_text(
+                    f"<b>📊 MY MT5 ACCOUNTS</b>\n\n"
+                    f"You don't have any accounts yet.\n\n"
+                    f"{msg}\n\n"
+                    f"Use /addaccount to add your first account.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Create message with accounts
+            message = "<b>📊 MY MT5 ACCOUNTS</b>\n\n"
+            
+            for i, acc in enumerate(accounts, 1):
+                status_emoji = "✅" if acc['enabled'] else "⏸"
+                status_text = "ENABLED" if acc['enabled'] else "DISABLED"
+                
+                message += f"<b>{i}. {acc['nickname']}</b>\n"
+                message += f"   Status: {status_emoji} {status_text}\n"
+                message += f"   Login: {acc['login']}\n"
+                message += f"   Broker: {acc['broker']}\n"
+                message += f"   Server: {acc['server']}\n"
+                message += f"   Trades: {acc['total_trades']}\n"
+                message += f"   Added: {acc['added_date'][:10]}\n\n"
+            
+            # Add buttons for each account
+            keyboard = []
+            for acc in accounts:
+                row = [
+                    InlineKeyboardButton(
+                        f"{'⏸ Disable' if acc['enabled'] else '✅ Enable'} {acc['nickname'][:15]}", 
+                        callback_data=f"toggle_{acc['account_id']}"
+                    ),
+                    InlineKeyboardButton(
+                        f"🗑 Delete", 
+                        callback_data=f"delete_{acc['account_id']}"
+                    )
+                ]
+                keyboard.append(row)
+            
+            # Add "Add Account" button
+            can_add, add_msg = self.account_manager.can_add_account(user_id)
+            if can_add:
+                keyboard.append([InlineKeyboardButton("➕ Add New Account", callback_data="add_account")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message += f"\n<i>{add_msg}</i>"
+            
+            await update.message.reply_text(
+                message, 
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in myaccounts command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
+    
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline button callbacks"""
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            user_id = str(update.effective_user.id)
+            data = query.data
+            
+            if data.startswith("toggle_"):
+                # Toggle account
+                account_id = data.replace("toggle_", "")
+                success, message = self.account_manager.toggle_account(user_id, account_id)
+                
+                if success:
+                    # Refresh the accounts list
+                    await self._refresh_accounts_list(query, user_id)
+                    await query.message.reply_text(f"✅ {message}", parse_mode=ParseMode.HTML)
+                else:
+                    await query.message.reply_text(f"❌ {message}", parse_mode=ParseMode.HTML)
+            
+            elif data.startswith("delete_"):
+                # Confirm deletion
+                account_id = data.replace("delete_", "")
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{account_id}"),
+                        InlineKeyboardButton("❌ Cancel", callback_data="cancel_delete")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.message.reply_text(
+                    "⚠️ <b>Are you sure you want to delete this account?</b>\n\n"
+                    "This action cannot be undone.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+            
+            elif data.startswith("confirm_delete_"):
+                # Actually delete account
+                account_id = data.replace("confirm_delete_", "")
+                success, message = self.account_manager.remove_account(user_id, account_id)
+                
+                if success:
+                    await query.message.edit_text(f"✅ {message}", parse_mode=ParseMode.HTML)
+                    # Refresh the accounts list
+                    await asyncio.sleep(1)
+                    await self._refresh_accounts_list(query, user_id)
+                else:
+                    await query.message.edit_text(f"❌ {message}", parse_mode=ParseMode.HTML)
+            
+            elif data == "cancel_delete":
+                await query.message.edit_text("Deletion cancelled.", parse_mode=ParseMode.HTML)
+            
+            elif data == "add_account":
+                await query.message.reply_text(
+                    "Use /addaccount to start adding a new account.",
+                    parse_mode=ParseMode.HTML
+                )
+            
+        except Exception as e:
+            logger.error(f"Error handling callback: {e}")
+    
+    async def _refresh_accounts_list(self, query, user_id: str):
+        """Refresh the accounts list message"""
+        try:
+            accounts = self.account_manager.get_user_accounts(user_id)
+            
+            message = "<b>📊 MY MT5 ACCOUNTS</b>\n\n"
+            
+            for i, acc in enumerate(accounts, 1):
+                status_emoji = "✅" if acc['enabled'] else "⏸"
+                status_text = "ENABLED" if acc['enabled'] else "DISABLED"
+                
+                message += f"<b>{i}. {acc['nickname']}</b>\n"
+                message += f"   Status: {status_emoji} {status_text}\n"
+                message += f"   Login: {acc['login']}\n"
+                message += f"   Broker: {acc['broker']}\n"
+                message += f"   Trades: {acc['total_trades']}\n\n"
+            
+            keyboard = []
+            for acc in accounts:
+                row = [
+                    InlineKeyboardButton(
+                        f"{'⏸ Disable' if acc['enabled'] else '✅ Enable'} {acc['nickname'][:15]}", 
+                        callback_data=f"toggle_{acc['account_id']}"
+                    ),
+                    InlineKeyboardButton(
+                        f"🗑 Delete", 
+                        callback_data=f"delete_{acc['account_id']}"
+                    )
+                ]
+                keyboard.append(row)
+            
+            can_add, add_msg = self.account_manager.can_add_account(user_id)
+            if can_add:
+                keyboard.append([InlineKeyboardButton("➕ Add New Account", callback_data="add_account")])
+            
+            message += f"\n<i>{add_msg}</i>"
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.edit_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error refreshing accounts list: {e}")
+    
+    # ==================== EXISTING COMMANDS (UPDATED) ====================
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         try:
             user_id = update.effective_user.id
             first_name = update.effective_user.first_name or "Trader"
-            username = update.effective_user.username or "User"
-            
-            # Log the interaction
-            logger.info(f"User {user_id} ({first_name}) sent /start command")
             
             welcome_message = f"""
 <b>👋 Hello {first_name}, Welcome to NIXIE'S TRADING BOT!</b>
 
-I'm your AI-powered institutional trading assistant, designed to help you trade like the smart money.
+🎯 <b>Enhanced Features:</b>
+✓ High-precision SMC signals
+✓ Multi-user MT5 auto-execution
+✓ TP/SL hit notifications
+✓ Secure account management
+✓ Accurate win rate tracking
 
-<b>🎯 What I Do:</b>
-I analyze Forex pairs, Metals, and Indices using Smart Money Concepts (SMC) to identify high-probability trading opportunities with institutional precision.
+<b> Commands:</b>
+/subscribe - Get trading signals
+/addaccount - Add your MT5 account
+/myaccounts - Manage your accounts
+/unsubscribe - Stop signals
+/status - Check subscription
+/stats - View performance stats
+/help - Detailed help
 
-<b>💡 Key Features:</b>
-• High-precision SMC strategy
-• ML-enhanced signal quality (65%+ win rate target)
-• Multi-timeframe analysis (H4, H1, M5, M1)
-• Minimum 1:3 Risk:Reward ratio
-• Real-time market scanning every 5 minutes
-• Hourly market updates
-• Automatic ML training and improvement
+<b> Your Accounts:</b>
+Add up to 5 MT5 accounts for auto-execution!
+Your credentials are encrypted and secure.
 
-<b>📱 Available Commands:</b>
-/subscribe - Start receiving trading signals
-/unsubscribe - Stop receiving signals
-/status - Check your subscription status
-/stats - View bot performance statistics
-/help - Get detailed help information
-
-<b>🚀 Ready to Get Started?</b>
-Type /subscribe to begin receiving high-quality trading signals!
-
-<b>⚠️ Important Reminder:</b>
-Always practice proper risk management. Never risk more than 2% per trade. Start with a demo account if you're new.
-
-<i>Built with precision by Blessing Omoregie (Nixiestone)</i>
-<i>Where AI Meets Smart Money 💰</i>
+<i>Built by Blessing Omoregie (Nixiestone)</i>
 """
             
             await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
@@ -145,347 +438,104 @@ Always practice proper risk management. Never risk more than 2% per trade. Start
         except Exception as e:
             logger.error(f"Error in start command: {e}")
     
-    async def cmd_subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /subscribe command"""
-        try:
-            user_id = update.effective_user.id
-            username = update.effective_user.username or "Unknown"
-            
-            # Check if already subscribed
-            is_subscribed = await self.db.is_user_subscribed(user_id)
-            
-            if is_subscribed:
-                await update.message.reply_text(
-                    "You are already subscribed to trading signals.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            # Subscribe user
-            await self.db.subscribe_user(user_id, username)
-            
-            message = """
-<b>SUBSCRIPTION ACTIVATED</b>
-
-You are now subscribed to Nixie's Trading Bot signals.
-
-You will receive:
-- High-probability trading signals
-- Hourly market updates
-- Signal performance tracking
-
-<b>Signal Format Includes:</b>
-- Entry price and type
-- Stop Loss and Take Profit levels
-- Risk:Reward ratio
-- ML Confidence score
-- Market conditions
-
-Stay disciplined and follow risk management rules.
-
-<i>Good luck with your trading</i>
-"""
-            
-            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-            logger.info(f"User {user_id} ({username}) subscribed")
-            
-        except Exception as e:
-            logger.error(f"Error in subscribe command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
-    
-    async def cmd_unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /unsubscribe command"""
-        try:
-            user_id = update.effective_user.id
-            
-            # Check if subscribed
-            is_subscribed = await self.db.is_user_subscribed(user_id)
-            
-            if not is_subscribed:
-                await update.message.reply_text(
-                    "You are not currently subscribed.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            # Unsubscribe user
-            await self.db.unsubscribe_user(user_id)
-            
-            message = """
-<b>SUBSCRIPTION CANCELLED</b>
-
-You have been unsubscribed from trading signals.
-
-You will no longer receive:
-- Trading signals
-- Market updates
-
-To resubscribe, use /subscribe command.
-
-Thank you for using Nixie's Trading Bot.
-"""
-            
-            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-            logger.info(f"User {user_id} unsubscribed")
-            
-        except Exception as e:
-            logger.error(f"Error in unsubscribe command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
-    
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /status command"""
-        try:
-            user_id = update.effective_user.id
-            first_name = update.effective_user.first_name or "Trader"
-            username = update.effective_user.username or "Unknown"
-            
-            # Get subscription status
-            is_subscribed = await self.db.is_user_subscribed(user_id)
-            subscription_date = await self.db.get_subscription_date(user_id)
-            
-            status_emoji = "✅" if is_subscribed else "❌"
-            status_text = "ACTIVE" if is_subscribed else "INACTIVE"
-            
-            message = f"""
-<b>📊 SUBSCRIPTION STATUS</b>
-
-<b>Hello {first_name}!</b>
-
-<b>Status:</b> {status_emoji} {status_text}
-<b>User ID:</b> {user_id}
-<b>Username:</b> @{username}
-"""
-            
-            if is_subscribed and subscription_date:
-                message += f"<b>Subscribed Since:</b> {subscription_date.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                days_subscribed = (datetime.now() - subscription_date).days
-                message += f"<b>Days Active:</b> {days_subscribed} days\n"
-            
-            message += "\n"
-            
-            if is_subscribed:
-                message += "<b>✓ You are receiving:</b>\n"
-                message += "• High-probability trading signals\n"
-                message += "• Hourly market updates\n"
-                message += "• Real-time notifications\n"
-                message += "• ML-enhanced predictions\n\n"
-                message += "<i>Keep trading smart, {first_name}! 🚀</i>"
-            else:
-                message += "<b>⚠️ You are NOT subscribed</b>\n\n"
-                message += "Use /subscribe to start receiving:\n"
-                message += "• Trading signals\n"
-                message += "• Market updates\n"
-                message += "• Performance tracking\n\n"
-                message += f"<i>Join us, {first_name}! 💪</i>"
-            
-            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-            
-        except Exception as e:
-            logger.error(f"Error in status command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
-    
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stats command"""
         try:
-            # Get bot statistics
-            total_signals = await self.db.get_signal_count()
-            total_subscribers = await self.db.get_subscriber_count()
+            user_id = str(update.effective_user.id)
             
-            # Get ML stats
+            # Get bot stats
+            win_rate_stats = self.main_bot.signal_generator.get_win_rate()
+            active_signals = self.main_bot.signal_generator.get_active_signals_count()
             ml_stats = await self.main_bot.ml_engine.get_model_stats()
+            subscribers = await self.db.get_subscriber_count()
             
-            # Get signal performance
-            win_rate = await self.db.get_win_rate()
-            avg_rr = await self.db.get_average_rr()
+            # Get account stats
+            account_stats = self.account_manager.get_total_accounts()
+            user_accounts = self.account_manager.get_user_accounts(user_id)
+            user_enabled = len([a for a in user_accounts if a['enabled']])
             
             message = f"""
-<b>BOT STATISTICS</b>
+<b>📊 BOT STATISTICS</b>
 
-<b>System Status:</b> {'ONLINE' if self.main_bot.running else 'OFFLINE'}
+<b>Performance:</b>
+- Win Rate: {win_rate_stats['win_rate']:.1f}%
+- Total Trades: {win_rate_stats['total']}
+- Wins: {win_rate_stats['wins']} | Losses: {win_rate_stats['losses']}
+- Profit Factor: {win_rate_stats['profit_factor']:.2f}
 
-<b>Signal Statistics:</b>
-- Total Signals: {total_signals}
-- Win Rate: {win_rate:.1f}%
-- Avg R:R: 1:{avg_rr:.2f}
+<b>Active:</b>
+- Monitoring: {active_signals} signals
+- Subscribers: {subscribers}
+
+<b>Your Accounts:</b>
+- Total: {len(user_accounts)}
+- Enabled: {user_enabled}
+
+<b>Global Accounts:</b>
+- Users with accounts: {account_stats['total_users']}
+- Total accounts: {account_stats['total_accounts']}
+- Enabled: {account_stats['enabled_accounts']}
 
 <b>ML Engine:</b>
-- Model Trained: {'Yes' if ml_stats.get('model_trained') else 'No'}
-- Training Data: {ml_stats.get('total_signals', 0)} signals
-- Next Training: {ml_stats.get('next_training', 0)} signals
+- Trained: {'Yes' if ml_stats.get('model_trained') else 'No'}
+- Data: {ml_stats.get('total_signals', 0)} signals
 
-<b>Community:</b>
-- Active Subscribers: {total_subscribers}
-
-<i>Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+<i>Updated: {datetime.now().strftime('%H:%M:%S UTC')}</i>
 """
             
             await update.message.reply_text(message, parse_mode=ParseMode.HTML)
             
         except Exception as e:
             logger.error(f"Error in stats command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
     
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
-        try:
-            first_name = update.effective_user.first_name or "Trader"
-            
-            help_message = f"""
-<b>📚 NIXIE'S TRADING BOT - HELP GUIDE</b>
-
-<b>Hello {first_name}!</b> Here's everything you need to know:
-
-<b>🤖 Bot Commands:</b>
-/start - Welcome message and bot overview
-/subscribe - Subscribe to trading signals
-/unsubscribe - Unsubscribe from signals
-/status - Check your subscription status
-/stats - View bot performance statistics
-/help - Show this help message
-
-<b>📊 About Trading Signals:</b>
-Signals are generated using Smart Money Concepts (SMC) strategy, focusing on institutional order flow patterns. 
-
-<b>Each signal includes:</b>
-• Symbol and Direction (BUY/SELL)
-• Entry Price and Type (LIMIT/MARKET)
-• Stop Loss (SL) in pips and price
-• Take Profit (TP) in pips and price
-• Risk:Reward Ratio (minimum 1:3)
-• ML Confidence Score (0-100%)
-• Signal Strength (LOW/MEDIUM/HIGH/VERY_HIGH)
-• Market Conditions and Technical Data
-• Setup Type (FVG, Order Block, Confluence)
-
-<b>💰 Risk Management Rules:</b>
-• Never risk more than 2% per trade
-• Always use the provided stop losses
-• Follow the Risk:Reward ratios exactly
-• Trade only during recommended sessions (London/NY)
-• Start with demo account if you're new
-
-<b>🎯 Trading Strategy:</b>
-The bot uses institutional precision scalping with:
-• Multi-timeframe analysis (H4, H1, M5, M1)
-• Liquidity sweep identification
-• Order Block and Fair Value Gap detection
-• Market structure analysis (BOS/ChoCH)
-• Machine Learning signal enhancement
-• Real-time scanning every 5 minutes
-
-<b>📈 Expected Performance:</b>
-• Target Win Rate: 65%+
-• Minimum R:R: 1:3
-• Typical Signals: 2-5 per day
-• Hourly updates if no signals
-
-<b>⚡ Pro Tips:</b>
-• Be patient - quality over quantity
-• High-probability setups are rare
-• Trust the ML confidence scores
-• Follow signals exactly as provided
-• Review your trading journal regularly
-
-<b>❓ Need More Help?</b>
-Contact the developer or check the documentation.
-
-<i>Trade smart, trade safe, {first_name}! 🚀</i>
-<i>Author: Blessing Omoregie (Nixiestone)</i>
-"""
-            
-            await update.message.reply_text(help_message, parse_mode=ParseMode.HTML)
-            
-        except Exception as e:
-            logger.error(f"Error in help command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
-    
-    async def broadcast_signal(self, signal: Dict):
-        """Broadcast trading signal to all subscribers"""
-        try:
-            message = self._format_signal_message(signal)
-            subscribers = await self.db.get_subscribers()
-            
-            sent_count = 0
-            failed_count = 0
-            
-            for subscriber in subscribers:
-                try:
-                    await self.bot.send_message(
-                        chat_id=subscriber['user_id'],
-                        text=message,
-                        parse_mode=ParseMode.HTML
-                    )
-                    sent_count += 1
-                    await asyncio.sleep(0.1)  # Rate limiting
-                except Exception as e:
-                    logger.error(f"Failed to send signal to {subscriber['user_id']}: {e}")
-                    failed_count += 1
-            
-            logger.info(f"Signal broadcast complete. Sent: {sent_count}, Failed: {failed_count}")
-            
-        except Exception as e:
-            logger.error(f"Error broadcasting signal: {e}", exc_info=True)
-    
-    async def broadcast_message(self, message: str):
-        """Broadcast general message to all subscribers"""
-        try:
-            subscribers = await self.db.get_subscribers()
-            
-            if not subscribers:
-                logger.warning("No subscribers to broadcast to")
-                return
-            
-            for subscriber in subscribers:
-                try:
-                    await self.bot.send_message(
-                        chat_id=subscriber['user_id'],
-                        text=message,
-                        parse_mode=ParseMode.HTML
-                    )
-                    await asyncio.sleep(0.1)  # Rate limiting
-                except Exception as e:
-                    logger.error(f"Failed to send message to {subscriber['user_id']}: {e}")
-            
-        except Exception as e:
-            logger.error(f"Error broadcasting message: {e}", exc_info=True)
-    
-    def _format_signal_message(self, signal: Dict) -> str:
-        """Format trading signal for Telegram"""
-        timestamp = signal['timestamp'].strftime('%Y-%m-%d %H:%M:%S UTC')
+        first_name = update.effective_user.first_name or "Trader"
         
-        direction_emoji = "BUY" if signal['direction'] == 'BUY' else "SELL"
-        
-        message = f"""
-<b>NEW TRADING SIGNAL</b>
+        help_message = f"""
+<b>📚 HELP GUIDE</b>
 
-<b>Symbol:</b> {signal['symbol']}
-<b>Direction:</b> {direction_emoji}
-<b>Signal Strength:</b> {signal['signal_strength']}
+<b> Basic Commands:</b>
+/start - Welcome & overview
+/subscribe - Get trading signals
+/unsubscribe - Stop signals
+/status - Check subscription
+/stats - Performance statistics
+/help - This message
 
-<b>ENTRY DETAILS:</b>
-Entry Type: {signal['entry_type']}
-Entry Price: {signal['entry_price']:.5f}
+<b> Account Management:</b>
+/addaccount - Add MT5 account (max 5)
+/myaccounts - Manage your accounts
+/cancel - Cancel account setup
 
-<b>RISK MANAGEMENT:</b>
-Stop Loss: {signal['stop_loss']:.5f} ({signal['sl_pips']:.1f} pips)
-Take Profit: {signal['take_profit']:.5f} ({signal['tp_pips']:.1f} pips)
-Risk:Reward: 1:{signal['risk_reward']:.2f}
+<b> Admin Commands:</b>
+/autoexec - Global auto-execution toggle
 
-<b>TECHNICAL DATA:</b>
-Setup: {signal['setup_type']}
-ML Confidence: {signal['ml_confidence']:.1f}%
-Current Price: {signal['current_price']:.5f}
-ATR: {signal['atr']:.5f}
-RSI: {signal['rsi']:.1f}
+<b> How Account Management Works:</b>
 
-<b>MARKET CONDITIONS:</b>
-Trend: {signal['trend']}
-Bias: {signal['market_bias']}
-Volatility: {signal['volatility']}
+1. <b>Adding Accounts:</b>
+   • Use /addaccount to start
+   • Follow the interactive setup
+   • Provide: broker, server, login, password
+   • Your password is encrypted
 
-<b>Time Generated:</b> {timestamp}
+2. <b>Managing Accounts:</b>
+   • Use /myaccounts to view all
+   • Toggle auto-execution per account
+   • Delete accounts you no longer need
 
-<i>Follow strict risk management. Never risk more than 2% per trade.</i>
+3. <b>Security:</b>
+   • All passwords are encrypted
+   • Only you can access your accounts
+   • Each account is isolated
+   • Delete anytime
+
+<b> Auto-Execution:</b>
+When enabled, signals are automatically executed on YOUR accounts with YOUR funds. Make sure you understand the risks!
+
+<i>Trade smart, {first_name}! </i>
 """
         
-        return message
+        await update.message.reply_text(help_message, parse_mode=ParseMode.HTML)
+    
+    

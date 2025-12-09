@@ -1,6 +1,5 @@
 """
 Signal Generation System
-Generates trading signals based on SMC analysis and ML predictions
 """
 
 from datetime import datetime, timedelta
@@ -87,7 +86,7 @@ class SignalGenerator:
             # Update last signal time
             self.last_signal_time[symbol] = datetime.now()
             
-            logger.info(f"Signal generated for {symbol}: {direction} @ {entry_data['entry']}")
+            logger.info(f"Signal generated for {symbol}: {direction} {entry_data['entry_type']} @ {entry_data['entry']}")
             
             return signal
             
@@ -184,8 +183,126 @@ class SignalGenerator:
             logger.error(f"Error determining direction: {e}")
             return 'NEUTRAL'
     
+    def _determine_entry_type(self, current_price: float, entry_zone: Dict, 
+                             direction: str, displacement_strength: float, 
+                             volatility: str) -> str:
+        """
+        Determine entry order type: MARKET, LIMIT, BUY_STOP, SELL_STOP
+        
+        Order Type Logic:
+        
+        MARKET:
+        - Price already in optimal entry zone
+        - Strong displacement happening NOW (>3.5)
+        - High volatility environment
+        - Immediate execution needed
+        
+        LIMIT (Buy/Sell at better price):
+        - Price away from entry zone (above for BUY, below for SELL)
+        - Waiting for pullback/retracement
+        - Better risk:reward on patient entry
+        
+        BUY_STOP (Buy above current price):
+        - BUY signal but price below entry zone
+        - Waiting for breakout confirmation
+        - Price needs to break through resistance
+        
+        SELL_STOP (Sell below current price):
+        - SELL signal but price above entry zone
+        - Waiting for breakdown confirmation
+        - Price needs to break through support
+        """
+        try:
+            entry_upper = entry_zone['upper']
+            entry_lower = entry_zone['lower']
+            entry_mid = (entry_upper + entry_lower) / 2
+            
+            # Calculate distance from entry zone
+            zone_size = entry_upper - entry_lower
+            
+            # Strong displacement and high volatility favor immediate execution
+            strong_displacement = displacement_strength > 3.5
+            high_volatility = volatility == 'HIGH'
+            immediate_entry = strong_displacement or high_volatility
+            
+            if direction == 'BUY':
+                # Price is IN the entry zone
+                if entry_lower <= current_price <= entry_upper:
+                    if immediate_entry:
+                        return 'MARKET'  # Execute NOW
+                    else:
+                        return 'BUY_LIMIT'  # Wait for better price within zone
+                
+                # Price is ABOVE entry zone (already moved past ideal entry)
+                elif current_price > entry_upper:
+                    distance = current_price - entry_upper
+                    
+                    # Too far above (>50% of zone size) = wait for pullback
+                    if distance > zone_size * 0.5:
+                        return 'BUY_LIMIT'  # Wait for retracement
+                    
+                    # Close above but moving fast = chase with market
+                    elif immediate_entry:
+                        return 'MARKET'
+                    
+                    # Otherwise wait for pullback
+                    else:
+                        return 'BUY_LIMIT'
+                
+                # Price is BELOW entry zone (needs to come up to entry)
+                else:  # current_price < entry_lower
+                    distance = entry_lower - current_price
+                    
+                    # Very close to zone (<25% zone size) = use LIMIT
+                    if distance < zone_size * 0.25:
+                        return 'BUY_LIMIT'  # Close enough for limit
+                    
+                    # Far below = wait for breakout confirmation
+                    else:
+                        return 'BUY_STOP'  # Stop order at entry zone
+            
+            else:  # SELL
+                # Price is IN the entry zone
+                if entry_lower <= current_price <= entry_upper:
+                    if immediate_entry:
+                        return 'MARKET'  # Execute NOW
+                    else:
+                        return 'SELL_LIMIT'  # Wait for better price within zone
+                
+                # Price is BELOW entry zone (already moved past ideal entry)
+                elif current_price < entry_lower:
+                    distance = entry_lower - current_price
+                    
+                    # Too far below (>50% of zone size) = wait for pullback
+                    if distance > zone_size * 0.5:
+                        return 'SELL_LIMIT'  # Wait for retracement
+                    
+                    # Close below but moving fast = chase with market
+                    elif immediate_entry:
+                        return 'MARKET'
+                    
+                    # Otherwise wait for pullback
+                    else:
+                        return 'SELL_LIMIT'
+                
+                # Price is ABOVE entry zone (needs to come down to entry)
+                else:  # current_price > entry_upper
+                    distance = current_price - entry_upper
+                    
+                    # Very close to zone (<25% zone size) = use LIMIT
+                    if distance < zone_size * 0.25:
+                        return 'SELL_LIMIT'  # Close enough for limit
+                    
+                    # Far above = wait for breakdown confirmation
+                    else:
+                        return 'SELL_STOP'  # Stop order at entry zone
+                    
+        except Exception as e:
+            logger.error(f"Error determining entry type: {e}")
+            return 'BUY_LIMIT' if direction == 'BUY' else 'SELL_LIMIT'  # Safe default
+    
     def _calculate_entry_levels(self, market_state: Dict, direction: str) -> Optional[Dict]:
-        """Calculate entry, SL, and TP levels"""
+        """Calculate entry, SL, and TP levels with smart order type selection"""
         try:
             current_price = market_state['current_price']
             symbol_info = self.config.get_symbol_info(market_state['symbol'])
@@ -193,6 +310,9 @@ class SignalGenerator:
             
             fvgs = market_state.get('fvgs', [])
             order_blocks = market_state.get('order_blocks', [])
+            displacement = market_state.get('m1_displacement', {})
+            displacement_strength = displacement.get('strength', 0)
+            volatility = market_state.get('volatility', 'MEDIUM')
             
             if direction == 'BUY':
                 # Find bullish OB or FVG for entry
@@ -201,16 +321,35 @@ class SignalGenerator:
                 if not entry_zone:
                     return None
                 
-                # Entry at 50% of OB/FVG
-                entry = (entry_zone['upper'] + entry_zone['lower']) / 2
+                # Determine entry type (MARKET, BUY_LIMIT, BUY_STOP)
+                entry_type = self._determine_entry_type(
+                    current_price, entry_zone, direction, displacement_strength, volatility
+                )
                 
-                # SL below the zone
-                sl = entry_zone['lower'] - (10 * point)
+                # Calculate entry price based on order type
+                if entry_type == 'MARKET':
+                    # Use current price for immediate market orders
+                    entry = current_price
+                    
+                elif entry_type == 'BUY_LIMIT':
+                    # Use lower part of zone for better entry on pullback
+                    entry = entry_zone['lower'] + (entry_zone['upper'] - entry_zone['lower']) * 0.3
+                    
+                elif entry_type == 'BUY_STOP':
+                    # Place stop above current price, at entry zone
+                    entry = entry_zone['lower']  # Break into the zone
+                    
+                else:
+                    entry = (entry_zone['upper'] + entry_zone['lower']) / 2
+                
+                # SL below the zone with buffer
+                sl_buffer = 10 * point
+                sl = entry_zone['lower'] - sl_buffer
                 
                 # Calculate SL in pips
                 sl_pips = abs(entry - sl) / point
                 
-                # TP based on minimum 1:3 RR
+                # TP based on minimum R:R
                 tp_pips = sl_pips * self.config.MIN_RISK_REWARD
                 tp = entry + (tp_pips * point)
                 
@@ -220,8 +359,10 @@ class SignalGenerator:
                 if rr < self.config.MIN_RISK_REWARD:
                     return None
                 
+                logger.info(f"BUY {entry_type}: Entry={entry:.5f}, SL={sl:.5f}, TP={tp:.5f}, R:R=1:{rr:.2f}")
+                
                 return {
-                    'entry_type': 'LIMIT',
+                    'entry_type': entry_type,
                     'entry': round(entry, 5),
                     'sl': round(sl, 5),
                     'tp': round(tp, 5),
@@ -237,16 +378,35 @@ class SignalGenerator:
                 if not entry_zone:
                     return None
                 
-                # Entry at 50% of OB/FVG
-                entry = (entry_zone['upper'] + entry_zone['lower']) / 2
+                # Determine entry type (MARKET, SELL_LIMIT, SELL_STOP)
+                entry_type = self._determine_entry_type(
+                    current_price, entry_zone, direction, displacement_strength, volatility
+                )
                 
-                # SL above the zone
-                sl = entry_zone['upper'] + (10 * point)
+                # Calculate entry price based on order type
+                if entry_type == 'MARKET':
+                    # Use current price for immediate market orders
+                    entry = current_price
+                    
+                elif entry_type == 'SELL_LIMIT':
+                    # Use upper part of zone for better entry on pullback
+                    entry = entry_zone['upper'] - (entry_zone['upper'] - entry_zone['lower']) * 0.3
+                    
+                elif entry_type == 'SELL_STOP':
+                    # Place stop below current price, at entry zone
+                    entry = entry_zone['upper']  # Break into the zone
+                    
+                else:
+                    entry = (entry_zone['upper'] + entry_zone['lower']) / 2
+                
+                # SL above the zone with buffer
+                sl_buffer = 10 * point
+                sl = entry_zone['upper'] + sl_buffer
                 
                 # Calculate SL in pips
                 sl_pips = abs(sl - entry) / point
                 
-                # TP based on minimum 1:3 RR
+                # TP based on minimum R:R
                 tp_pips = sl_pips * self.config.MIN_RISK_REWARD
                 tp = entry - (tp_pips * point)
                 
@@ -256,8 +416,10 @@ class SignalGenerator:
                 if rr < self.config.MIN_RISK_REWARD:
                     return None
                 
+                logger.info(f"SELL {entry_type}: Entry={entry:.5f}, SL={sl:.5f}, TP={tp:.5f}, R:R=1:{rr:.2f}")
+                
                 return {
-                    'entry_type': 'LIMIT',
+                    'entry_type': entry_type,
                     'entry': round(entry, 5),
                     'sl': round(sl, 5),
                     'tp': round(tp, 5),

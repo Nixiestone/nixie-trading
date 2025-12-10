@@ -726,8 +726,79 @@ class SignalGenerator:
     
     def _find_bearish_entry_zone(self, fvgs: list, order_blocks: list, current_price: float) -> Optional[Dict]:
         """Find bearish entry zone"""
-        bearish_obs = [ob for ob in order_blocks if ob['type'] == 'BEARISH']
-        bearish_fvgs = [fvg for fvg in fvgs if fvg['type'] == 'BEARISH']
-        
-        for ob in bearish_obs:
-            for fvg in bearish_fvgs
+        try:
+            bearish_obs = [ob for ob in order_blocks if ob['type'] == 'BEARISH']
+            bearish_fvgs = [fvg for fvg in fvgs if fvg['type'] == 'BEARISH']
+            
+            # Check for confluence
+            for ob in bearish_obs:
+                for fvg in bearish_fvgs:
+                    if (ob['lower'] <= fvg['upper'] and ob['upper'] >= fvg['lower']):
+                        return {
+                            'upper': max(ob['upper'], fvg['upper']),
+                            'lower': min(ob['lower'], fvg['lower']),
+                            'type': 'CONFLUENCE'
+                        }
+            
+            # Use OB if available
+            if bearish_obs:
+                return {
+                    'upper': bearish_obs[0]['upper'],
+                    'lower': bearish_obs[0]['lower'],
+                    'type': 'ORDER_BLOCK'
+                }
+            
+            # Use FVG as fallback
+            if bearish_fvgs:
+                return {
+                    'upper': bearish_fvgs[0]['upper'],
+                    'lower': bearish_fvgs[0]['lower'],
+                    'type': 'FVG'
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding bearish entry zone: {e}")
+            return None
+    
+    def _calculate_signal_strength(self, market_state: Dict, ml_confidence: float) -> str:
+        """Calculate overall signal strength"""
+        try:
+            strength_score = 0
+            
+            # Trend alignment (0-30 points)
+            trend = market_state.get('htf_trend', 'NEUTRAL')
+            if 'STRONG' in trend:
+                strength_score += 30
+            elif trend != 'NEUTRAL':
+                strength_score += 20
+            
+            # Structure confirmation (0-20 points)
+            if market_state.get('htf_structure', {}).get('bos_detected'):
+                strength_score += 20
+            
+            # Setup quality (0-20 points)
+            fvgs = market_state.get('fvgs', [])
+            order_blocks = market_state.get('order_blocks', [])
+            if fvgs and order_blocks:
+                strength_score += 20
+            elif fvgs or order_blocks:
+                strength_score += 10
+            
+            # ML confidence (0-30 points)
+            strength_score += (ml_confidence / 100) * 30
+            
+            # Categorize
+            if strength_score >= 80:
+                return 'VERY_HIGH'
+            elif strength_score >= 65:
+                return 'HIGH'
+            elif strength_score >= 50:
+                return 'MEDIUM'
+            else:
+                return 'LOW'
+                
+        except Exception as e:
+            logger.error(f"Error calculating signal strength: {e}")
+            return 'MEDIUM'

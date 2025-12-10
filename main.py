@@ -1,11 +1,9 @@
 """
-Nixie's Trading Bot - Updated Main Entry Point
-NOW WITH:
-- Duplicate signal prevention
-- Auto CSV export
-- Trade monitoring (TP/SL notifications)
-- MT5 auto-execution (toggle on/off)
-- Accurate win rate tracking
+Nixie's Trading Bot - Main Entry Point
+Author: Blessing Omoregie
+GitHub: Nixiestone
+
+High-Precision SMC Trading Bot with ML Integration
 """
 
 import sys
@@ -16,30 +14,36 @@ from datetime import datetime
 from colorama import init, Fore, Style
 from pyfiglet import Figlet
 
-# Create directories
+# CRITICAL: Create directories BEFORE any imports that use them
 def ensure_directories():
     """Ensure all required directories exist"""
     directories = ['data', 'logs', 'models']
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
+        print(f"[INIT] Directory ensured: {directory}/")
 
+# Create directories first
 ensure_directories()
+
+# Initialize colorama for cross-platform colored output
 init(autoreset=True)
 
+# Now import modules that depend on directories
 from src.config.settings import Config
 from src.core.market_analyzer import MarketAnalyzer
 from src.core.signal_generator import SignalGenerator
 from src.core.ml_engine import MLEngine
 from src.telegram.bot_handler import TelegramBotHandler
 from src.mt5.connection import MT5Connection
-from src.mt5.auto_executor import MT5AutoExecutor  # NEW
+from src.mt5.multi_user_executor import MultiUserMT5Executor
+from src.mt5.auto_executor import MT5AutoExecutor 
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 
 class NixieTradingBot:
-    """Main trading bot with enhanced features"""
+    """Main trading bot orchestrator"""
     
     def __init__(self):
         self.config = Config()
@@ -49,20 +53,23 @@ class NixieTradingBot:
         self.signal_generator = None
         self.ml_engine = None
         self.telegram_handler = None
-        self.auto_executor = None  # NEW
+        self.auto_executor = None
         self.last_hourly_update = None
-        self.last_trade_check = None  # NEW
+        self.last_trade_check = None
         
     def display_banner(self):
         """Display animated startup banner"""
         banner_text = "NIXIE'S TRADING BOT"
+        
+        # Create large ASCII art
         fig = Figlet(font='slant')
         ascii_banner = fig.renderText(banner_text)
         
+        # Animate the banner
         colors = [Fore.CYAN, Fore.BLUE, Fore.MAGENTA, Fore.CYAN]
         
         for color in colors:
-            sys.stdout.write('\033[2J\033[H')
+            sys.stdout.write('\033[2J\033[H')  # Clear screen
             print(color + Style.BRIGHT + ascii_banner)
             print(Fore.WHITE + Style.BRIGHT + "=" * 80)
             print(Fore.GREEN + Style.BRIGHT + "High-Precision Institutional Scalping System")
@@ -78,7 +85,7 @@ class NixieTradingBot:
         try:
             logger.info("Starting Nixie's Trading Bot initialization...")
             
-            # Validate configuration
+            # Verify configuration
             print(Fore.CYAN + "[CONFIG] Validating configuration...")
             try:
                 self.config.validate()
@@ -92,10 +99,11 @@ class NixieTradingBot:
             self.mt5_connection = MT5Connection(self.config)
             if not await self.mt5_connection.connect():
                 print(Fore.RED + "[ERROR] Failed to connect to MT5")
+                print(Fore.YELLOW + "[HINT] Make sure MT5 is running and logged in")
                 return False
             print(Fore.GREEN + "[MT5] Connected successfully")
             
-            # Initialize auto-executor
+             # Initialize auto-executor
             print(Fore.CYAN + "[EXECUTOR] Initializing auto-execution module...")
             self.auto_executor = MT5AutoExecutor(self.mt5_connection, self.config)
             
@@ -117,8 +125,8 @@ class NixieTradingBot:
             await self.ml_engine.initialize()
             print(Fore.GREEN + "[ML] Machine learning engine loaded")
             
-            # Initialize signal generator (ENHANCED VERSION)
-            print(Fore.CYAN + "[SIGNAL] Initializing enhanced signal generation system...")
+            # Initialize signal generator
+            print(Fore.CYAN + "[SIGNAL] Initializing signal generation system...")
             self.signal_generator = SignalGenerator(
                 self.market_analyzer,
                 self.ml_engine,
@@ -139,6 +147,7 @@ class NixieTradingBot:
                 print(Fore.GREEN + "[TELEGRAM] Telegram bot started")
             except Exception as e:
                 print(Fore.RED + f"[ERROR] Telegram initialization failed: {e}")
+                print(Fore.YELLOW + "[HINT] Check your TELEGRAM_BOT_TOKEN in .env file")
                 return False
             
             # Send startup notification
@@ -149,6 +158,7 @@ class NixieTradingBot:
                 print(Fore.GREEN + "[TELEGRAM] Startup notification sent")
             except Exception as e:
                 logger.error(f"Failed to send startup notification: {e}")
+                print(Fore.YELLOW + f"[WARNING] Could not send Telegram notification: {e}")
             
             logger.info("Bot initialization completed successfully")
             print(Fore.GREEN + Style.BRIGHT + "\n[SYSTEM] All systems operational. Bot is now active.\n")
@@ -161,20 +171,17 @@ class NixieTradingBot:
             return False
     
     async def run(self):
-        """Main bot loop with trade monitoring"""
+        """Main bot loop"""
         self.running = True
         self.last_hourly_update = datetime.now()
         self.last_trade_check = datetime.now()
         
-        scan_interval = 300  # 5 minutes
+        scan_interval = 300  # 5 minutes in seconds
         trade_check_interval = self.config.CHECK_TRADES_INTERVAL  # 30 seconds
-        hourly_interval = 3600
+        hourly_interval = 3600  # 1 hour in seconds
         
         logger.info("Starting main trading loop")
-        print(Fore.YELLOW + "[LOOP] Entering main trading loop")
-        print(Fore.CYAN + f"  • Market scan: every {scan_interval//60} minutes")
-        print(Fore.CYAN + f"  • Trade check: every {trade_check_interval} seconds")
-        print(Fore.CYAN + f"  • Market updates: every hour")
+        print(Fore.YELLOW + "[LOOP] Entering main trading loop (5-min scan, 1-hour updates)")
         
         try:
             while self.running:
@@ -195,7 +202,7 @@ class NixieTradingBot:
                     await self.send_hourly_update()
                     self.last_hourly_update = datetime.now()
                 
-                # Sleep for remaining time
+                # Sleep for remaining time in 5-minute interval
                 elapsed = time.time() - loop_start
                 sleep_time = max(0, min(scan_interval, trade_check_interval) - elapsed)
                 
@@ -226,17 +233,20 @@ class NixieTradingBot:
                     if not market_state:
                         continue
                     
-                    # Generate signal (with duplicate prevention)
+                    # Generate signal if conditions met
                     signal = await self.signal_generator.generate_signal(symbol, market_state)
                     
                     if signal:
-                        # Broadcast signal to Telegram
+                        # Send signal to subscribers
                         await self.telegram_handler.broadcast_signal(signal)
                         
                         # Store signal for ML training
                         await self.ml_engine.store_signal(signal)
                         
-                        # Execute in MT5 if enabled
+                        logger.info(f"Signal generated for {symbol}: {signal['direction']}")
+                        print(Fore.GREEN + f"[SIGNAL] Generated for {symbol} - {signal['direction']}")
+                        
+                         # Execute in MT5 if enabled
                         if self.auto_executor.is_enabled():
                             ticket = await self.auto_executor.execute_signal(signal)
                             if ticket:
@@ -248,14 +258,14 @@ class NixieTradingBot:
                         
                 except Exception as e:
                     logger.error(f"Error scanning {symbol}: {e}")
+                    print(Fore.RED + f"[ERROR] Scanning {symbol}: {e}")
             
-            # Display active signals count
-            active_count = self.signal_generator.get_active_signals_count()
-            print(Fore.CYAN + f"[SCAN] Completed | Active signals: {active_count}")
+            print(Fore.CYAN + "[SCAN] Market scan completed")
             
         except Exception as e:
             logger.error(f"Error in market scan: {e}", exc_info=True)
-    
+            
+            
     async def monitor_trades(self):
         """Monitor active trades for TP/SL hits"""
         try:
@@ -276,7 +286,7 @@ class NixieTradingBot:
             logger.error(f"Error monitoring trades: {e}", exc_info=True)
     
     async def send_hourly_update(self):
-        """Send hourly market update"""
+        """Send hourly market update to subscribers"""
         try:
             print(Fore.MAGENTA + "[UPDATE] Generating hourly market update...")
             
@@ -292,9 +302,8 @@ class NixieTradingBot:
                     logger.error(f"Error getting update for {symbol}: {e}")
             
             if updates:
-                # Include win rate stats
                 win_rate_stats = self.signal_generator.get_win_rate()
-                message = self._format_hourly_message(updates, win_rate_stats)
+                message = self._format_hourly_message(updates)
                 await self.telegram_handler.broadcast_message(message)
                 print(Fore.GREEN + "[UPDATE] Hourly update sent")
             
@@ -304,7 +313,7 @@ class NixieTradingBot:
     def _format_startup_message(self):
         """Format bot startup notification"""
         auto_exec_status = "ENABLED ⚠️" if self.auto_executor.is_enabled() else "DISABLED ✓"
-        
+
         return f"""
 <b>NIXIE'S TRADING BOT - SYSTEM ONLINE</b>
 
@@ -328,7 +337,9 @@ class NixieTradingBot:
 ✓ Accurate win rate tracking
 
 <b>System Message:</b>
-All trading systems operational. Enhanced trade management active.
+All trading systems are operational. The bot will now monitor markets and send signals when high-probability setups are identified.
+
+Market updates will be sent hourly if no signals are generated.
 """
     
     def _format_market_update(self, symbol, market_state):
@@ -341,8 +352,8 @@ All trading systems operational. Enhanced trade management active.
             'bias': market_state.get('bias', 'NEUTRAL')
         }
     
-    def _format_hourly_message(self, updates, win_rate_stats):
-        """Format hourly update message with stats"""
+    def _format_hourly_message(self, updates):
+        """Format hourly update message"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
         
         message = f"<b>HOURLY MARKET UPDATE</b>\n"
@@ -354,16 +365,14 @@ All trading systems operational. Enhanced trade management active.
         message += f"Trades: {win_rate_stats['wins']}W / {win_rate_stats['losses']}L\n"
         message += f"Active Signals: {self.signal_generator.get_active_signals_count()}\n\n"
         
-        # Market conditions
-        message += f"<b>💹 Market Conditions:</b>\n"
-        for update in updates[:10]:  # Show first 10
-            message += f"<b>{update['symbol']}</b> - {update['price']:.5f}\n"
-            message += f"  {update['trend']} | {update['volatility']} vol | {update['bias']}\n"
+        for update in updates:
+            message += f"<b>{update['symbol']}</b>\n"
+            message += f"Price: {update['price']:.5f}\n"
+            message += f"Trend: {update['trend']}\n"
+            message += f"Volatility: {update['volatility']}\n"
+            message += f"Bias: {update['bias']}\n\n"
         
-        if len(updates) > 10:
-            message += f"\n<i>...and {len(updates)-10} more pairs</i>\n"
-        
-        message += "\n<i>Monitoring markets continuously...</i>"
+        message += "<i>No high-probability signals detected this hour.</i>"
         
         return message
     
@@ -375,7 +384,6 @@ All trading systems operational. Enhanced trade management active.
             # Send shutdown notification
             if self.telegram_handler:
                 try:
-                    win_rate_stats = self.signal_generator.get_win_rate()
                     shutdown_msg = f"""
 <b>NIXIE'S TRADING BOT - SYSTEM OFFLINE</b>
 
@@ -389,7 +397,8 @@ All trading systems operational. Enhanced trade management active.
 - Losses: {win_rate_stats['losses']}
 
 All data saved to CSV files.
-The bot has been shut down gracefully.
+
+The bot has been shut down. No further signals or updates will be sent until restarted.
 """
                     await self.telegram_handler.broadcast_message(shutdown_msg)
                 except Exception as e:
@@ -416,12 +425,20 @@ async def main():
     """Main entry point"""
     bot = NixieTradingBot()
     
+    # Display banner
     bot.display_banner()
     
+    # Initialize bot
     if await bot.initialize():
+        # Run bot
         await bot.run()
     else:
         print(Fore.RED + "[SYSTEM] Failed to start bot. Check logs for details.")
+        print(Fore.YELLOW + "\n[HINT] Common issues:")
+        print(Fore.YELLOW + "  1. Check .env file has correct credentials")
+        print(Fore.YELLOW + "  2. Ensure MetaTrader 5 is running")
+        print(Fore.YELLOW + "  3. Verify Telegram bot token is valid")
+        print(Fore.YELLOW + "  4. Check logs/nixie_bot.log for details")
         sys.exit(1)
 
 

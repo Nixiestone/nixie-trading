@@ -21,6 +21,10 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_ADMIN_ID = os.getenv('TELEGRAM_ADMIN_ID', '')
     
+    # AUTO-EXECUTION TOGGLE (NEW FEATURE)
+    # Set to 'true' or 'false' in .env file
+    AUTO_EXECUTE_TRADES = os.getenv('AUTO_EXECUTE_TRADES', 'false').lower() == 'true'
+    
     # Trading Symbols (Exness notation)
     TRADING_SYMBOLS = [
         # Forex Majors
@@ -46,8 +50,8 @@ class Config:
     TIMEFRAMES = {
         'HTF': '240',  # H4 for higher timeframe analysis
         'MTF': '60',   # H1 for intermediate
-        'LTF_ENTRY': '5',   # M5 for entry confirmation
-        'LTF_PRECISION': '1'  # M1 for precision entry
+        'LTF_ENTRY': '15',   # M5 for entry confirmation
+        'LTF_PRECISION': '5'  # M1 for precision entry
     }
     
     # Kill Zones (UTC time)
@@ -74,6 +78,8 @@ class Config:
     
     # Database
     DB_PATH = 'data/trading_data.db'
+    CSV_SIGNALS_PATH = 'data/signals_log.csv'
+    CSV_CLOSED_PATH = 'data/closed_trades.csv'
     
     # Logging
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -86,6 +92,9 @@ class Config:
     # Notification Settings
     HOURLY_UPDATE_ENABLED = True
     SIGNAL_COOLDOWN = 300  # 5 minutes between signals for same symbol
+    
+    # Trade Monitoring
+    CHECK_TRADES_INTERVAL = 30  # Check every 30 seconds for TP/SL hits
     
     @classmethod
     def validate(cls):

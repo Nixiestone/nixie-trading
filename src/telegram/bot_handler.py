@@ -1,19 +1,20 @@
 """
 Enhanced Telegram Bot Handler with User Account Management
+FIXED VERSION - All methods complete, proper error handling
 """
 
 import os
 import asyncio
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from src.telegram.pdf_generator import PDFGenerator
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError, RetryAfter
 from datetime import datetime
 from typing import Dict, List
 from src.utils.logger import setup_logger
 from src.utils.database import Database
-from src.core.user_account_manager import MT5AccountManager, UserAccountSetupHandler
+from src.telegram.pdf_generator import PDFGenerator
 
 logger = setup_logger(__name__)
 
@@ -30,10 +31,6 @@ class TelegramBotHandler:
         self.db = Database(config.DB_PATH)
         self.pdf_generator = PDFGenerator()
         
-        # Account management
-        self.account_manager = MT5AccountManager(config)
-        self.setup_handler = UserAccountSetupHandler()
-        
     async def initialize(self):
         """Initialize Telegram bot"""
         max_retries = 3
@@ -43,18 +40,17 @@ class TelegramBotHandler:
             try:
                 logger.info(f"Initializing Telegram bot (attempt {attempt}/{max_retries})...")
                 
+                # Increased timeouts for better reliability
                 request = HTTPXRequest(
                     connection_pool_size=8,
-                    connect_timeout=30.0,
-                    read_timeout=30.0,
-                    write_timeout=30.0,
-                    pool_timeout=30.0
+                    connect_timeout=60.0,
+                    read_timeout=60.0,
+                    write_timeout=60.0,
+                    pool_timeout=60.0
                 )
                 
                 self.app = Application.builder().token(self.bot_token).request(request).build()
                 self.bot = self.app.bot
-                self.app.add_handler(CommandHandler("downloadsignals", self.cmd_download_signals))
-                self.app.add_handler(CommandHandler("downloadclosed", self.cmd_download_closed))
                 
                 # Basic commands
                 self.app.add_handler(CommandHandler("start", self.cmd_start))
@@ -63,21 +59,10 @@ class TelegramBotHandler:
                 self.app.add_handler(CommandHandler("status", self.cmd_status))
                 self.app.add_handler(CommandHandler("stats", self.cmd_stats))
                 self.app.add_handler(CommandHandler("help", self.cmd_help))
-                self.app.add_handler(CommandHandler("autoexec", self.cmd_autoexec))
                 
-                # Account management commands (NEW)
-                self.app.add_handler(CommandHandler("addaccount", self.cmd_add_account))
-                self.app.add_handler(CommandHandler("myaccounts", self.cmd_my_accounts))
-                self.app.add_handler(CommandHandler("cancel", self.cmd_cancel))
-                
-                # Message handler for account setup
-                self.app.add_handler(MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, 
-                    self.handle_setup_message
-                ))
-                
-                # Callback query handler for inline buttons
-                self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+                # Admin commands
+                self.app.add_handler(CommandHandler("downloadsignals", self.cmd_download_signals))
+                self.app.add_handler(CommandHandler("downloadclosed", self.cmd_download_closed))
                 
                 await asyncio.wait_for(self.app.initialize(), timeout=30)
                 await asyncio.wait_for(self.app.start(), timeout=30)
@@ -110,389 +95,7 @@ class TelegramBotHandler:
         except Exception as e:
             logger.error(f"Error shutting down Telegram: {e}")
     
-    # ==================== ACCOUNT MANAGEMENT COMMANDS ====================
-    
-    async def cmd_add_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /addaccount command"""
-        try:
-            user_id = str(update.effective_user.id)
-            
-            # Check if user already has a pending setup
-            if self.setup_handler.has_pending_setup(user_id):
-                await update.message.reply_text(
-                    "You already have an account setup in progress.\nUse /cancel to stop it.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            # Check if user can add more accounts
-            can_add, message = self.account_manager.can_add_account(user_id)
-            
-            if not can_add:
-                await update.message.reply_text(
-                    f"❌ {message}\n\nUse /myaccounts to manage existing accounts.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            # Start setup process
-            welcome_msg = self.setup_handler.start_setup(user_id)
-            await update.message.reply_text(welcome_msg, parse_mode=ParseMode.HTML)
-            
-            logger.info(f"User {user_id} started account setup")
-            
-        except Exception as e:
-            logger.error(f"Error in addaccount command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
-    
-    async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /cancel command"""
-        try:
-            user_id = str(update.effective_user.id)
-            
-            if self.setup_handler.cancel_setup(user_id):
-                await update.message.reply_text(
-                    "✅ Account setup cancelled.\n\nUse /addaccount to start over.",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await update.message.reply_text(
-                    "No setup in progress.",
-                    parse_mode=ParseMode.HTML
-                )
-            
-        except Exception as e:
-            logger.error(f"Error in cancel command: {e}")
-    
-    async def handle_setup_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle messages during account setup"""
-        try:
-            user_id = str(update.effective_user.id)
-            
-            # Check if user has pending setup
-            if not self.setup_handler.has_pending_setup(user_id):
-                return  # Not in setup mode, ignore
-            
-            input_text = update.message.text.strip()
-            
-            # Process the input
-            completed, message, account_data = self.setup_handler.process_input(user_id, input_text)
-            
-            # Send response
-            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-            
-            # If setup completed and confirmed
-            if completed and account_data:
-                # Add account to manager
-                success, result_msg = self.account_manager.add_account(user_id, account_data)
-                
-                if success:
-                    final_msg = f"""
-<b>🎉 ACCOUNT ADDED SUCCESSFULLY!</b>
-
-<b>Nickname:</b> {account_data['nickname']}
-<b>Login:</b> {account_data['login']}
-<b>Auto-Execution:</b> ENABLED ✅
-
-Your account is now active and will automatically execute signals.
-
-<b>What's Next?</b>
-• Signals will be auto-executed on this account
-• You'll receive notifications for all trades
-• Use /myaccounts to manage this account
-
-<b>Security:</b>
-• Your credentials are encrypted
-• Only you can access this account
-• You can remove it anytime
-
-<i>Happy trading! 🚀</i>
-"""
-                    await update.message.reply_text(final_msg, parse_mode=ParseMode.HTML)
-                    logger.info(f"User {user_id} successfully added account: {account_data['nickname']}")
-                else:
-                    await update.message.reply_text(
-                        f"❌ Failed to add account: {result_msg}\n\nPlease try again with /addaccount",
-                        parse_mode=ParseMode.HTML
-                    )
-            
-        except Exception as e:
-            logger.error(f"Error handling setup message: {e}")
-            await update.message.reply_text(
-                "An error occurred. Use /cancel to stop and try again.",
-                parse_mode=ParseMode.HTML
-            )
-    
-    async def cmd_my_accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /myaccounts command - show user's accounts"""
-        try:
-            user_id = str(update.effective_user.id)
-            
-            # Get user's accounts
-            accounts = self.account_manager.get_user_accounts(user_id)
-            
-            if not accounts:
-                can_add, msg = self.account_manager.can_add_account(user_id)
-                await update.message.reply_text(
-                    f"<b>📊 MY MT5 ACCOUNTS</b>\n\n"
-                    f"You don't have any accounts yet.\n\n"
-                    f"{msg}\n\n"
-                    f"Use /addaccount to add your first account.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            # Create message with accounts
-            message = "<b>📊 MY MT5 ACCOUNTS</b>\n\n"
-            
-            for i, acc in enumerate(accounts, 1):
-                status_emoji = "✅" if acc['enabled'] else "⏸"
-                status_text = "ENABLED" if acc['enabled'] else "DISABLED"
-                
-                message += f"<b>{i}. {acc['nickname']}</b>\n"
-                message += f"   Status: {status_emoji} {status_text}\n"
-                message += f"   Login: {acc['login']}\n"
-                message += f"   Broker: {acc['broker']}\n"
-                message += f"   Server: {acc['server']}\n"
-                message += f"   Trades: {acc['total_trades']}\n"
-                message += f"   Added: {acc['added_date'][:10]}\n\n"
-            
-            # Add buttons for each account
-            keyboard = []
-            for acc in accounts:
-                row = [
-                    InlineKeyboardButton(
-                        f"{'⏸ Disable' if acc['enabled'] else '✅ Enable'} {acc['nickname'][:15]}", 
-                        callback_data=f"toggle_{acc['account_id']}"
-                    ),
-                    InlineKeyboardButton(
-                        f"🗑 Delete", 
-                        callback_data=f"delete_{acc['account_id']}"
-                    )
-                ]
-                keyboard.append(row)
-            
-            # Add "Add Account" button
-            can_add, add_msg = self.account_manager.can_add_account(user_id)
-            if can_add:
-                keyboard.append([InlineKeyboardButton("➕ Add New Account", callback_data="add_account")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            message += f"\n<i>{add_msg}</i>"
-            
-            await update.message.reply_text(
-                message, 
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in myaccounts command: {e}")
-            await update.message.reply_text("An error occurred. Please try again.")
-    
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline button callbacks"""
-        try:
-            query = update.callback_query
-            await query.answer()
-            
-            user_id = str(update.effective_user.id)
-            data = query.data
-            
-            if data.startswith("toggle_"):
-                # Toggle account
-                account_id = data.replace("toggle_", "")
-                success, message = self.account_manager.toggle_account(user_id, account_id)
-                
-                if success:
-                    # Refresh the accounts list
-                    await self._refresh_accounts_list(query, user_id)
-                    await query.message.reply_text(f"✅ {message}", parse_mode=ParseMode.HTML)
-                else:
-                    await query.message.reply_text(f"❌ {message}", parse_mode=ParseMode.HTML)
-            
-            elif data.startswith("delete_"):
-                # Confirm deletion
-                account_id = data.replace("delete_", "")
-                
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{account_id}"),
-                        InlineKeyboardButton("❌ Cancel", callback_data="cancel_delete")
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.message.reply_text(
-                    "⚠️ <b>Are you sure you want to delete this account?</b>\n\n"
-                    "This action cannot be undone.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
-                )
-            
-            elif data.startswith("confirm_delete_"):
-                # Actually delete account
-                account_id = data.replace("confirm_delete_", "")
-                success, message = self.account_manager.remove_account(user_id, account_id)
-                
-                if success:
-                    await query.message.edit_text(f"✅ {message}", parse_mode=ParseMode.HTML)
-                    # Refresh the accounts list
-                    await asyncio.sleep(1)
-                    await self._refresh_accounts_list(query, user_id)
-                else:
-                    await query.message.edit_text(f"❌ {message}", parse_mode=ParseMode.HTML)
-            
-            elif data == "cancel_delete":
-                await query.message.edit_text("Deletion cancelled.", parse_mode=ParseMode.HTML)
-            
-            elif data == "add_account":
-                await query.message.reply_text(
-                    "Use /addaccount to start adding a new account.",
-                    parse_mode=ParseMode.HTML
-                )
-            
-        except Exception as e:
-            logger.error(f"Error handling callback: {e}")
-    
-    async def _refresh_accounts_list(self, query, user_id: str):
-        """Refresh the accounts list message"""
-        try:
-            accounts = self.account_manager.get_user_accounts(user_id)
-            
-            message = "<b>📊 MY MT5 ACCOUNTS</b>\n\n"
-            
-            for i, acc in enumerate(accounts, 1):
-                status_emoji = "✅" if acc['enabled'] else "⏸"
-                status_text = "ENABLED" if acc['enabled'] else "DISABLED"
-                
-                message += f"<b>{i}. {acc['nickname']}</b>\n"
-                message += f"   Status: {status_emoji} {status_text}\n"
-                message += f"   Login: {acc['login']}\n"
-                message += f"   Broker: {acc['broker']}\n"
-                message += f"   Trades: {acc['total_trades']}\n\n"
-            
-            keyboard = []
-            for acc in accounts:
-                row = [
-                    InlineKeyboardButton(
-                        f"{'⏸ Disable' if acc['enabled'] else '✅ Enable'} {acc['nickname'][:15]}", 
-                        callback_data=f"toggle_{acc['account_id']}"
-                    ),
-                    InlineKeyboardButton(
-                        f"🗑 Delete", 
-                        callback_data=f"delete_{acc['account_id']}"
-                    )
-                ]
-                keyboard.append(row)
-            
-            can_add, add_msg = self.account_manager.can_add_account(user_id)
-            if can_add:
-                keyboard.append([InlineKeyboardButton("➕ Add New Account", callback_data="add_account")])
-            
-            message += f"\n<i>{add_msg}</i>"
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.message.edit_text(
-                message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-            
-        except Exception as e:
-            logger.error(f"Error refreshing accounts list: {e}")
-            
-            
-    
-async def cmd_download_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download signals log as PDF (Admin only)"""
-    try:
-        user_id = str(update.effective_user.id)
-        
-        # Check if admin
-        if user_id != self.config.TELEGRAM_ADMIN_ID:
-            await update.message.reply_text(
-                "⛔ This command is only available to the bot administrator.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        await update.message.reply_text("📄 Generating PDF report... Please wait.")
-        
-        # Generate PDF
-        pdf_file = f"data/signals_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        success = self.pdf_generator.generate_signals_pdf(
-            'data/signals_log.csv', 
-            pdf_file
-        )
-        
-        if success and os.path.exists(pdf_file):
-            # Send PDF
-            with open(pdf_file, 'rb') as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=f"Nixie_Signals_{datetime.now().strftime('%Y%m%d')}.pdf",
-                    caption="📊 <b>Signals Report</b>\n\nAll generated signals with outcomes.",
-                    parse_mode=ParseMode.HTML
-                )
-            
-            # Clean up
-            os.remove(pdf_file)
-            logger.info(f"Admin {user_id} downloaded signals PDF")
-        else:
-            await update.message.reply_text(
-                "❌ Failed to generate PDF. Check if signals exist.",
-                parse_mode=ParseMode.HTML
-            )
-        
-    except Exception as e:
-        logger.error(f"Error in download signals command: {e}")
-        await update.message.reply_text("❌ An error occurred generating the PDF.")
-
-async def cmd_download_closed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download closed trades as PDF (Admin only)"""
-    try:
-        user_id = str(update.effective_user.id)
-        
-        if user_id != self.config.TELEGRAM_ADMIN_ID:
-            await update.message.reply_text(
-                "⛔ This command is only available to the bot administrator.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        await update.message.reply_text("📄 Generating closed trades PDF... Please wait.")
-        
-        pdf_file = f"data/closed_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        success = self.pdf_generator.generate_closed_trades_pdf(
-            'data/closed_trades.csv',
-            pdf_file
-        )
-        
-        if success and os.path.exists(pdf_file):
-            with open(pdf_file, 'rb') as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=f"Nixie_Closed_Trades_{datetime.now().strftime('%Y%m%d')}.pdf",
-                    caption="📈 <b>Closed Trades Report</b>\n\nAll completed trades with outcomes.",
-                    parse_mode=ParseMode.HTML
-                )
-            
-            os.remove(pdf_file)
-            logger.info(f"Admin {user_id} downloaded closed trades PDF")
-        else:
-            await update.message.reply_text(
-                "❌ Failed to generate PDF. Check if closed trades exist.",
-                parse_mode=ParseMode.HTML
-            )
-        
-    except Exception as e:
-        logger.error(f"Error in download closed command: {e}")
-        await update.message.reply_text("❌ An error occurred generating the PDF.")
-    
-    # ==================== EXISTING COMMANDS (UPDATED) ====================
+    # ==================== BASIC COMMANDS ====================
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -503,24 +106,22 @@ async def cmd_download_closed(self, update: Update, context: ContextTypes.DEFAUL
             welcome_message = f"""
 <b>👋 Hello {first_name}, Welcome to NIXIE'S TRADING BOT!</b>
 
-🎯 <b>Enhanced Features:</b>
+🎯 <b>Features:</b>
 ✓ High-precision SMC signals
-✓ Multi-user MT5 auto-execution
 ✓ TP/SL hit notifications
-✓ Secure account management
 ✓ Accurate win rate tracking
+✓ MT5 auto-execution (optional)
 
 <b>📱 Commands:</b>
 /subscribe - Get trading signals
-/addaccount - Add your MT5 account
-/myaccounts - Manage your accounts
+/unsubscribe - Stop signals
 /status - Check subscription
-/stats - View performance stats
+/stats - View performance
 /help - Detailed help
 
-<b>🔐 Your Accounts:</b>
-Add up to 5 MT5 accounts for auto-execution!
-Your credentials are encrypted and secure.
+<b>🔐 Security:</b>
+All signals are based on institutional SMC strategy.
+Risk management built-in (2% max per trade).
 
 <i>Built by Blessing Omoregie (Nixiestone)</i>
 """
@@ -529,22 +130,139 @@ Your credentials are encrypted and secure.
             
         except Exception as e:
             logger.error(f"Error in start command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
+    
+    async def cmd_subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /subscribe command"""
+        try:
+            user_id = update.effective_user.id
+            username = update.effective_user.username or update.effective_user.first_name
+            
+            # Check if already subscribed
+            is_subscribed = await self.db.is_user_subscribed(user_id)
+            
+            if is_subscribed:
+                await update.message.reply_text(
+                    "✅ You are already subscribed to trading signals!",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Subscribe user
+            await self.db.subscribe_user(user_id, username)
+            
+            message = f"""
+<b>✅ SUBSCRIPTION ACTIVATED!</b>
+
+You will now receive:
+• High-quality SMC trading signals
+• TP/SL hit notifications with reasons
+• Real-time market updates
+
+<b>What to Expect:</b>
+• 2-5 signals per day (quality over quantity)
+• Minimum 1:3 Risk:Reward ratio
+• 65%+ target win rate
+• Detailed entry analysis
+
+<b>Risk Management:</b>
+• Never risk more than 2% per trade
+• Always use suggested stop losses
+• Follow the signals exactly as given
+
+<i>Happy trading! 🚀</i>
+"""
+            
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+            logger.info(f"User {user_id} ({username}) subscribed")
+            
+        except Exception as e:
+            logger.error(f"Error in subscribe command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
+    
+    async def cmd_unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /unsubscribe command"""
+        try:
+            user_id = update.effective_user.id
+            
+            # Check if subscribed
+            is_subscribed = await self.db.is_user_subscribed(user_id)
+            
+            if not is_subscribed:
+                await update.message.reply_text(
+                    "❌ You are not currently subscribed.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Unsubscribe user
+            await self.db.unsubscribe_user(user_id)
+            
+            message = """
+<b>✅ UNSUBSCRIBED SUCCESSFULLY</b>
+
+You will no longer receive trading signals.
+
+You can resubscribe anytime with /subscribe
+
+<i>We hope to see you again! 👋</i>
+"""
+            
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+            logger.info(f"User {user_id} unsubscribed")
+            
+        except Exception as e:
+            logger.error(f"Error in unsubscribe command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
+    
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /status command"""
+        try:
+            user_id = update.effective_user.id
+            
+            is_subscribed = await self.db.is_user_subscribed(user_id)
+            
+            if is_subscribed:
+                sub_date = await self.db.get_subscription_date(user_id)
+                date_str = sub_date.strftime('%Y-%m-%d') if sub_date else 'Unknown'
+                
+                message = f"""
+<b>📊 SUBSCRIPTION STATUS</b>
+
+<b>Status:</b> ✅ ACTIVE
+<b>Subscribed Since:</b> {date_str}
+<b>Signals:</b> Enabled
+
+You are receiving all trading signals and notifications.
+
+Use /unsubscribe to stop signals.
+"""
+            else:
+                message = """
+<b>📊 SUBSCRIPTION STATUS</b>
+
+<b>Status:</b> ❌ INACTIVE
+<b>Signals:</b> Disabled
+
+You are not receiving trading signals.
+
+Use /subscribe to start receiving signals.
+"""
+            
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+            
+        except Exception as e:
+            logger.error(f"Error in status command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
     
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stats command"""
         try:
-            user_id = str(update.effective_user.id)
-            
             # Get bot stats
             win_rate_stats = self.main_bot.signal_generator.get_win_rate()
             active_signals = self.main_bot.signal_generator.get_active_signals_count()
             ml_stats = await self.main_bot.ml_engine.get_model_stats()
             subscribers = await self.db.get_subscriber_count()
-            
-            # Get account stats
-            account_stats = self.account_manager.get_total_accounts()
-            user_accounts = self.account_manager.get_user_accounts(user_id)
-            user_enabled = len([a for a in user_accounts if a['enabled']])
             
             message = f"""
 <b>📊 BOT STATISTICS</b>
@@ -559,15 +277,6 @@ Your credentials are encrypted and secure.
 - Monitoring: {active_signals} signals
 - Subscribers: {subscribers}
 
-<b>Your Accounts:</b>
-- Total: {len(user_accounts)}
-- Enabled: {user_enabled}
-
-<b>Global Accounts:</b>
-- Users with accounts: {account_stats['total_users']}
-- Total accounts: {account_stats['total_accounts']}
-- Enabled: {account_stats['enabled_accounts']}
-
 <b>ML Engine:</b>
 - Trained: {'Yes' if ml_stats.get('model_trained') else 'No'}
 - Data: {ml_stats.get('total_signals', 0)} signals
@@ -579,6 +288,7 @@ Your credentials are encrypted and secure.
             
         except Exception as e:
             logger.error(f"Error in stats command: {e}")
+            await update.message.reply_text("An error occurred. Please try again.")
     
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
@@ -595,38 +305,291 @@ Your credentials are encrypted and secure.
 /stats - Performance statistics
 /help - This message
 
-<b>💼 Account Management:</b>
-/addaccount - Add MT5 account (max 5)
-/myaccounts - Manage your accounts
-/cancel - Cancel account setup
-
 <b>👑 Admin Commands:</b>
-/autoexec - Global auto-execution toggle
+/downloadsignals - Download signals PDF
+/downloadclosed - Download closed trades PDF
 
-<b>🔐 How Account Management Works:</b>
+<b>📊 How It Works:</b>
 
-1. <b>Adding Accounts:</b>
-   • Use /addaccount to start
-   • Follow the interactive setup
-   • Provide: broker, server, login, password
-   • Your password is encrypted
+1. <b>Subscribe:</b>
+   • Use /subscribe to start
+   • Receive 2-5 quality signals per day
+   • Get TP/SL notifications
 
-2. <b>Managing Accounts:</b>
-   • Use /myaccounts to view all
-   • Toggle auto-execution per account
-   • Delete accounts you no longer need
+2. <b>Signals:</b>
+   • Based on SMC strategy
+   • Minimum 1:3 Risk:Reward
+   • Includes entry, SL, TP
+   • ML confidence score
 
-3. <b>Security:</b>
-   • All passwords are encrypted
-   • Only you can access your accounts
-   • Each account is isolated
-   • Delete anytime
+3. <b>Risk Management:</b>
+   • Never risk more than 2% per trade
+   • Always use stop losses
+   • Follow signals exactly
 
-<b>🚀 Auto-Execution:</b>
-When enabled, signals are automatically executed on YOUR accounts with YOUR funds. Make sure you understand the risks!
+<b>🚀 Features:</b>
+✓ Duplicate signal prevention
+✓ Auto CSV export
+✓ TP/SL hit notifications
+✓ Accurate win rate tracking
 
 <i>Trade smart, {first_name}! 🚀</i>
 """
         
         await update.message.reply_text(help_message, parse_mode=ParseMode.HTML)
     
+    # ==================== ADMIN COMMANDS ====================
+    
+    async def cmd_download_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Download signals log as PDF (Admin only)"""
+        try:
+            user_id = str(update.effective_user.id)
+            
+            # Check if admin
+            if user_id != self.config.TELEGRAM_ADMIN_ID:
+                await update.message.reply_text(
+                    "⛔ This command is only available to the bot administrator.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            await update.message.reply_text("📄 Generating PDF report... Please wait.")
+            
+            # Check if CSV exists
+            if not os.path.exists('data/signals_log.csv'):
+                await update.message.reply_text(
+                    "❌ No signals data found. Generate some signals first.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Generate PDF
+            pdf_file = f"data/signals_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            success = self.pdf_generator.generate_signals_pdf(
+                'data/signals_log.csv', 
+                pdf_file
+            )
+            
+            if success and os.path.exists(pdf_file):
+                # Send PDF
+                with open(pdf_file, 'rb') as f:
+                    await update.message.reply_document(
+                        document=f,
+                        filename=f"Nixie_Signals_{datetime.now().strftime('%Y%m%d')}.pdf",
+                        caption="📊 <b>Signals Report</b>\n\nAll generated signals with outcomes.",
+                        parse_mode=ParseMode.HTML
+                    )
+                
+                # Clean up
+                os.remove(pdf_file)
+                logger.info(f"Admin {user_id} downloaded signals PDF")
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to generate PDF. Check logs for details.",
+                    parse_mode=ParseMode.HTML
+                )
+            
+        except Exception as e:
+            logger.error(f"Error in download signals command: {e}")
+            await update.message.reply_text("❌ An error occurred generating the PDF.")
+
+    async def cmd_download_closed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Download closed trades as PDF (Admin only)"""
+        try:
+            user_id = str(update.effective_user.id)
+            
+            if user_id != self.config.TELEGRAM_ADMIN_ID:
+                await update.message.reply_text(
+                    "⛔ This command is only available to the bot administrator.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            await update.message.reply_text("📄 Generating closed trades PDF... Please wait.")
+            
+            # Check if CSV exists
+            if not os.path.exists('data/closed_trades.csv'):
+                await update.message.reply_text(
+                    "❌ No closed trades data found. Wait for trades to close first.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            pdf_file = f"data/closed_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            success = self.pdf_generator.generate_closed_trades_pdf(
+                'data/closed_trades.csv',
+                pdf_file
+            )
+            
+            if success and os.path.exists(pdf_file):
+                with open(pdf_file, 'rb') as f:
+                    await update.message.reply_document(
+                        document=f,
+                        filename=f"Nixie_Closed_Trades_{datetime.now().strftime('%Y%m%d')}.pdf",
+                        caption="📈 <b>Closed Trades Report</b>\n\nAll completed trades with outcomes.",
+                        parse_mode=ParseMode.HTML
+                    )
+                
+                os.remove(pdf_file)
+                logger.info(f"Admin {user_id} downloaded closed trades PDF")
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to generate PDF. Check logs for details.",
+                    parse_mode=ParseMode.HTML
+                )
+            
+        except Exception as e:
+            logger.error(f"Error in download closed command: {e}")
+            await update.message.reply_text("❌ An error occurred generating the PDF.")
+    
+    # ==================== BROADCASTING METHODS ====================
+    
+    async def broadcast_signal(self, signal: Dict):
+        """Broadcast signal to all subscribers"""
+        try:
+            message = self._format_signal_message(signal)
+            await self.broadcast_message(message)
+            logger.info(f"Signal broadcast: {signal['symbol']} {signal['direction']}")
+            
+        except Exception as e:
+            logger.error(f"Error broadcasting signal: {e}")
+    
+    async def broadcast_message(self, message: str):
+        """Broadcast message to all subscribers with timeout handling"""
+        try:
+            subscribers = await self.db.get_subscribers()
+            
+            if not subscribers:
+                logger.warning("No subscribers to broadcast to")
+                return
+            
+            success_count = 0
+            fail_count = 0
+            
+            for subscriber in subscribers:
+                try:
+                    # Send with timeout and retry logic
+                    await asyncio.wait_for(
+                        self.bot.send_message(
+                            chat_id=subscriber['user_id'],
+                            text=message,
+                            parse_mode=ParseMode.HTML
+                        ),
+                        timeout=30.0  # 30 second timeout per message
+                    )
+                    success_count += 1
+                    
+                    # Small delay to avoid rate limiting
+                    await asyncio.sleep(0.1)
+                    
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout sending to {subscriber['user_id']}")
+                    fail_count += 1
+                    
+                except TimedOut:
+                    logger.warning(f"Telegram timeout for {subscriber['user_id']}")
+                    fail_count += 1
+                    
+                except NetworkError as e:
+                    logger.warning(f"Network error for {subscriber['user_id']}: {e}")
+                    fail_count += 1
+                    
+                except RetryAfter as e:
+                    logger.warning(f"Rate limited, waiting {e.retry_after}s")
+                    await asyncio.sleep(e.retry_after)
+                    # Retry once
+                    try:
+                        await self.bot.send_message(
+                            chat_id=subscriber['user_id'],
+                            text=message,
+                            parse_mode=ParseMode.HTML
+                        )
+                        success_count += 1
+                    except:
+                        fail_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"Failed to send to {subscriber['user_id']}: {e}")
+                    fail_count += 1
+            
+            logger.info(f"Broadcast complete: {success_count} sent, {fail_count} failed")
+            
+        except Exception as e:
+            logger.error(f"Error in broadcast_message: {e}")
+    
+    async def send_trade_closed_notification(self, notification: Dict):
+        """Send trade closed notification"""
+        try:
+            message = self._format_trade_closed_message(notification)
+            await self.broadcast_message(message)
+            logger.info(f"Trade closed notification sent: {notification['symbol']} {notification['outcome']}")
+            
+        except Exception as e:
+            logger.error(f"Error sending trade closed notification: {e}")
+    
+    # ==================== MESSAGE FORMATTERS ====================
+    
+    def _format_signal_message(self, signal: Dict) -> str:
+        """Format signal for Telegram"""
+        return f"""
+<b>🚨 NEW TRADING SIGNAL</b>
+
+<b>Symbol:</b> {signal['symbol']}
+<b>Direction:</b> {signal['direction']} {self._get_direction_emoji(signal['direction'])}
+<b>Signal Strength:</b> {signal['signal_strength']}
+
+<b>📍 ENTRY DETAILS:</b>
+Entry Type: {signal['entry_type']}
+Entry Price: {signal['entry_price']:.5f}
+
+<b>🛡 RISK MANAGEMENT:</b>
+Stop Loss: {signal['stop_loss']:.5f} ({signal['sl_pips']:.1f} pips)
+Take Profit: {signal['take_profit']:.5f} ({signal['tp_pips']:.1f} pips)
+Risk:Reward: 1:{signal['risk_reward']:.2f}
+
+<b>📊 TECHNICAL DATA:</b>
+Setup: {signal['setup_type']}
+ML Confidence: {signal['ml_confidence']:.1f}%
+Current Price: {signal['current_price']:.5f}
+ATR: {signal['atr']:.5f}
+RSI: {signal['rsi']:.1f}
+
+<b>📈 MARKET CONDITIONS:</b>
+Trend: {signal['trend']}
+Bias: {signal['market_bias']}
+Volatility: {signal['volatility']}
+
+<b>🕐 Time:</b> {signal['timestamp'].strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+<i>Signal ID: {signal['signal_id']}</i>
+"""
+    
+    def _format_trade_closed_message(self, notification: Dict) -> str:
+        """Format trade closed notification"""
+        outcome_emoji = "✅" if notification['outcome'] == 'WIN' else "❌"
+        
+        return f"""
+<b>{outcome_emoji} TRADE CLOSED - {notification['outcome']}</b>
+
+<b>Symbol:</b> {notification['symbol']}
+<b>Direction:</b> {notification['direction']}
+<b>Outcome:</b> {notification['outcome']}
+<b>Pips:</b> {notification['pips']:.1f}
+<b>Duration:</b> {notification['duration']}
+
+<b>📊 PRICES:</b>
+Entry: {notification['entry_price']:.5f}
+Exit: {notification['exit_price']:.5f}
+
+<b>💡 REASON:</b>
+{notification['reason']}
+
+<b>Setup:</b> {notification['setup_type']}
+<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+<i>Signal ID: {notification['signal_id']}</i>
+"""
+    
+    def _get_direction_emoji(self, direction: str) -> str:
+        """Get emoji for direction"""
+        return "🟢" if direction == "BUY" else "🔴"

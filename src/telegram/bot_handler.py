@@ -1,7 +1,6 @@
 """
 Enhanced Telegram Bot Handler with User Account Management
 """
-
 import os
 import asyncio
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -777,15 +776,158 @@ You will now receive:
         except Exception as e:
             logger.error(f"Error in status command: {e}")
     
-    async def cmd_autoexec(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /autoexec command - deprecated but kept for compatibility"""
+    async def broadcast_message(self, message: str):
+        """Broadcast general message to all subscribers"""
         try:
-            await update.message.reply_text(
-                "<b>ℹ️ AUTO-EXECUTION INFO</b>\n\n"
-                "Auto-execution is now managed per-account!\n\n"
-                "Use /myaccounts to enable/disable auto-execution for each of your MT5 accounts.\n\n"
-                "Each user controls their own accounts independently.",
-                parse_mode=ParseMode.HTML
-            )
+            subscribers = await self.db.get_subscribers()
+            
+            if not subscribers:
+                logger.warning("No subscribers to broadcast to")
+                return
+            
+            for subscriber in subscribers:
+                try:
+                    await self.bot.send_message(
+                        chat_id=subscriber['user_id'],
+                        text=message,
+                        parse_mode=ParseMode.HTML
+                    )
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Failed to send to {subscriber['user_id']}: {e}")
+            
         except Exception as e:
-            logger.error(f"Error in autoexec command: {e}")
+            logger.error(f"Error broadcasting message: {e}")
+    
+    async def broadcast_signal(self, signal: Dict):
+        """Broadcast trading signal"""
+        try:
+            message = self._format_signal_message(signal)
+            subscribers = await self.db.get_subscribers()
+            
+            for subscriber in subscribers:
+                try:
+                    await self.bot.send_message(
+                        chat_id=subscriber['user_id'],
+                        text=message,
+                        parse_mode=ParseMode.HTML
+                    )
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Failed to send to {subscriber['user_id']}: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error broadcasting signal: {e}")
+    
+    def _format_signal_message(self, signal: Dict) -> str:
+        """Format signal message"""
+        timestamp = signal['timestamp'].strftime('%Y-%m-%d %H:%M:%S UTC')
+        direction_emoji = "🔼" if signal['direction'] == 'BUY' else "🔽"
+        
+        message = f"""
+<b>🚨 NEW TRADING SIGNAL</b>
+
+{direction_emoji} <b>Symbol:</b> {signal['symbol']}
+<b>Direction:</b> {signal['direction']}
+<b>Entry Type:</b> {signal['entry_type']}
+<b>Signal Strength:</b> {signal['signal_strength']}
+
+<b>📍 ENTRY:</b>
+Entry Price: {signal['entry_price']:.5f}
+
+<b>🎯 TARGETS:</b>
+Stop Loss: {signal['stop_loss']:.5f} ({signal['sl_pips']:.1f} pips)
+Take Profit: {signal['take_profit']:.5f} ({signal['tp_pips']:.1f} pips)
+Risk:Reward: 1:{signal['risk_reward']:.2f}
+
+<b>📊 TECHNICAL:</b>
+Setup: {signal['setup_type']}
+ML Confidence: {signal['ml_confidence']:.1f}%
+Current Price: {signal['current_price']:.5f}
+Trend: {signal['trend']}
+Volatility: {signal['volatility']}
+
+<b>Signal ID:</b> {signal['signal_id']}
+<b>Time:</b> {timestamp}
+
+<i>Max 2% risk. Follow strict risk management!</i>
+"""
+        
+        return message
+    
+    async def execute_signal_for_users(self, signal: Dict) -> Dict:
+        """Execute signal on all enabled user accounts"""
+        try:
+            if not hasattr(self, 'multi_user_executor'):
+                from src.mt5.multi_user_executor import MultiUserMT5Executor
+                self.multi_user_executor = MultiUserMT5Executor(self.account_manager, self.config)
+            
+            return await self.multi_user_executor.execute_signal_for_all_users(signal)
+        except Exception as e:
+            logger.error(f"Error executing signal for users: {e}")
+            return {}
+    
+    async def send_trade_closed_notification(self, notification: Dict):
+        """Send notification when TP or SL hits"""
+        try:
+            message = self._format_trade_closed_message(notification)
+            subscribers = await self.db.get_subscribers()
+            
+            for subscriber in subscribers:
+                try:
+                    await self.bot.send_message(
+                        chat_id=subscriber['user_id'],
+                        text=message,
+                        parse_mode=ParseMode.HTML
+                    )
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Failed to send notification to {subscriber['user_id']}: {e}")
+            
+            logger.info(f"Trade closed notification sent: {notification['symbol']} {notification['outcome']}")
+            
+        except Exception as e:
+            logger.error(f"Error sending trade closed notification: {e}")
+    
+    def _format_trade_closed_message(self, notification: Dict) -> str:
+        """Format trade closed notification"""
+        outcome = notification['outcome']
+        symbol = notification['symbol']
+        direction = notification['direction']
+        pips = notification['pips']
+        duration = notification['duration']
+        reason = notification['reason']
+        entry_price = notification['entry_price']
+        exit_price = notification['exit_price']
+        setup_type = notification['setup_type']
+        
+        emoji = "🎉" if outcome == 'WIN' else "⚠️"
+        outcome_text = "TAKE PROFIT HIT" if outcome == 'WIN' else "STOP LOSS HIT"
+        color_indicator = "🟢" if outcome == 'WIN' else "🔴"
+        
+        message = f"""
+<b>{emoji} TRADE CLOSED - {outcome_text}</b>
+
+{color_indicator} <b>Symbol:</b> {symbol}
+<b>Direction:</b> {direction}
+<b>Outcome:</b> {outcome}
+
+<b>📊 TRADE DETAILS:</b>
+<b>Entry Price:</b> {entry_price:.5f}
+<b>Exit Price:</b> {exit_price:.5f}
+<b>Pips Result:</b> {'+' if pips > 0 else ''}{pips:.1f} pips
+<b>Duration:</b> {duration}
+<b>Setup Type:</b> {setup_type}
+
+<b>📝 ANALYSIS:</b>
+{reason}
+
+<b>⏰ Time Closed:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+        
+        if outcome == 'WIN':
+            message += "\n<i>Great trade! Keep following the strategy! 🚀</i>"
+        else:
+            message += "\n<i>Stop loss protected your capital. On to the next setup! 💪</i>"
+        
+        return message

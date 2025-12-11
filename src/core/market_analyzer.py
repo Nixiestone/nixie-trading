@@ -8,6 +8,8 @@ import numpy as np
 from datetime import datetime, time
 from typing import Dict, Optional, List, Tuple
 from src.utils.logger import setup_logger
+from src.core.fundamental_analyzer import FundamentalAnalyzer
+from src.core.enhanced_trend_analyzer import EnhancedTrendAnalyzer
 
 logger = setup_logger(__name__)
 
@@ -18,6 +20,8 @@ class MarketAnalyzer:
     def __init__(self, mt5_connection, config):
         self.mt5 = mt5_connection
         self.config = config
+        self.fundamental_analyzer = FundamentalAnalyzer(config)
+        self.trend_analyzer = EnhancedTrendAnalyzer()  
         
     async def analyze(self, symbol: str) -> Dict:
         """Complete market analysis for a symbol"""
@@ -38,10 +42,18 @@ class MarketAnalyzer:
             if not tick or not symbol_info:
                 return {}
             
-            # HTF Analysis - Directional Bias
+            # HTF Analysis - Directional Bias WITH ENHANCED TREND DETECTION
             htf_structure = self._analyze_structure(htf_data)
-            htf_trend = self._identify_trend(htf_data)
+            enhanced_trend_analysis = self.trend_analyzer.identify_trend(htf_data)  
+            htf_trend = enhanced_trend_analysis['trend']  # Use enhanced trend
             liquidity_levels = self._identify_liquidity_zones(htf_data)
+            
+            # NEW: Fundamental Analysis
+            fundamental_analysis = await self.fundamental_analyzer.analyze(symbol, {
+                'current_price': tick['bid'],
+                'volatility': self._calculate_volatility(ltf_data),
+                'bias': 'NEUTRAL'  # Will be updated below
+            })
             
             # MTF Analysis - Intermediate confirmation
             mtf_structure = self._analyze_structure(mtf_data)
@@ -72,6 +84,9 @@ class MarketAnalyzer:
                 'htf_trend': htf_trend,
                 'htf_structure': htf_structure,
                 'liquidity_levels': liquidity_levels,
+                'trend_quality': enhanced_trend_analysis['trend_quality'],  
+                'trend_strength': enhanced_trend_analysis['trend_strength'], 
+                'trend_confirmations': enhanced_trend_analysis['confirmations'], 
                 
                 # MTF Analysis
                 'mtf_structure': mtf_structure,
@@ -91,9 +106,18 @@ class MarketAnalyzer:
                 'rsi': rsi,
                 'volume_profile': volume_profile,
                 
-                # Bias determination
-                'bias': self._determine_bias(htf_trend, htf_structure, liquidity_levels),
+                # Bias determination (with fundamental influence)
+                'bias': self._determine_bias_with_fundamentals(
+                    htf_trend, htf_structure, liquidity_levels, fundamental_analysis  # UPDATED
+                    ),
                 'in_kill_zone': self._check_kill_zone(),
+                
+                 # NEW: Fundamental Analysis
+                 'fundamental_analysis': fundamental_analysis,
+                 'fundamental_bias': fundamental_analysis['fundamental_bias'],
+                 'sentiment': fundamental_analysis['sentiment'],
+                 'avoid_trading': fundamental_analysis['avoid_trading'],
+                 'session': fundamental_analysis['session_impact'],
                 
                 # Additional metrics
                 'trend_strength': self._calculate_trend_strength(htf_data),
@@ -480,8 +504,10 @@ class MarketAnalyzer:
             logger.error(f"Error analyzing volume: {e}")
             return {'status': 'NORMAL'}
     
-    def _determine_bias(self, trend: str, structure: Dict, liquidity_levels: List[Dict]) -> str:
-        """Determine trading bias"""
+    def _determine_bias_with_fundamentals(self, trend: str, structure: Dict, 
+                                      liquidity_levels: List[Dict],
+                                      fundamental: Dict) -> str:
+        """Determine trading bias using both technical and fundamental analysis"""
         try:
             bullish_factors = 0
             bearish_factors = 0
@@ -497,18 +523,26 @@ class MarketAnalyzer:
                 bullish_factors += 1
             elif structure.get('bos_direction') == 'BEARISH':
                 bearish_factors += 1
+                
+            # NEW: Fundamental bias
+            fundamental_bias = fundamental['fundamental_bias']
+            if fundamental_bias == 'BUY':
+                bullish_factors += 2  # Strong weight for fundamentals
+            elif fundamental_bias == 'SELL':
+                bearish_factors += 2
             
-            # Determine bias
-            if bullish_factors > bearish_factors:
+            # Determine final bias
+            if bullish_factors > bearish_factors + 1:  # Need clear advantage
                 return 'BULLISH'
-            elif bearish_factors > bullish_factors:
+            elif bearish_factors > bullish_factors + 1:
                 return 'BEARISH'
             else:
                 return 'NEUTRAL'
                 
         except Exception as e:
-            logger.error(f"Error determining bias: {e}")
+            logger.error(f"Error determining bias with fundamentals: {e}")
             return 'NEUTRAL'
+        
     
     def _check_kill_zone(self) -> bool:
         """Check if current time is in kill zone"""

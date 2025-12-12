@@ -4,7 +4,7 @@ Author: Blessing Omoregie
 GitHub: Nixiestone
 
 High-Precision SMC Trading Bot with ML Integration
-NOW WITH: Multi-User Account Management + Enhanced Features
+NOW WITH: Multi-User Account Management + News Service + Enhanced Features
 """
 
 import sys
@@ -37,6 +37,7 @@ from src.core.ml_engine import MLEngine
 from src.telegram.bot_handler import TelegramBotHandler
 from src.mt5.connection import MT5Connection
 from src.utils.logger import setup_logger
+from src.services.news_service import NewsService
 
 logger = setup_logger(__name__)
 
@@ -52,8 +53,9 @@ class NixieTradingBot:
         self.signal_generator = None
         self.ml_engine = None
         self.telegram_handler = None
+        self.news_service = None
         self.last_hourly_update = None
-        self.last_trade_check = None  # NEW: For monitoring trades
+        self.last_trade_check = None
         
     def display_banner(self):
         """Display animated startup banner"""
@@ -137,6 +139,21 @@ class NixieTradingBot:
                 print(Fore.YELLOW + "[HINT] Check your TELEGRAM_BOT_TOKEN in .env file")
                 return False
             
+            # Initialize News Service (NEW)
+            print(Fore.CYAN + "[NEWS] Initializing news service...")
+            try:
+                self.news_service = NewsService(self.config, self.telegram_handler)
+                self.signal_generator.news_service = self.news_service
+                self.news_service.start()
+                print(Fore.GREEN + "[NEWS] News service started")
+                print(Fore.GREEN + "  ✓ Daily news reports (8 AM)")
+                print(Fore.GREEN + "  ✓ 10-minute reminders")
+                print(Fore.GREEN + "  ✓ Live notifications")
+                print(Fore.GREEN + "  ✓ Auto timezone detection")
+            except Exception as e:
+                print(Fore.YELLOW + f"[WARNING] News service failed to start: {e}")
+                print(Fore.YELLOW + "[INFO] Bot will continue without news features")
+            
             # Send startup notification
             try:
                 await self.telegram_handler.broadcast_message(
@@ -161,11 +178,11 @@ class NixieTradingBot:
         """Main bot loop"""
         self.running = True
         self.last_hourly_update = datetime.now()
-        self.last_trade_check = datetime.now()  # NEW
+        self.last_trade_check = datetime.now()
         
-        scan_interval = 300  # 5 minutes in seconds
-        hourly_interval = 3600  # 1 hour in seconds
-        trade_check_interval = 30  # 30 seconds for trade monitoring (NEW)
+        scan_interval = 300  # 5 minutes
+        hourly_interval = 3600  # 1 hour
+        trade_check_interval = 30  # 30 seconds
         
         logger.info("Starting main trading loop")
         print(Fore.YELLOW + "[LOOP] Entering main trading loop (5-min scan, 1-hour updates, 30-sec trade check)")
@@ -177,7 +194,7 @@ class NixieTradingBot:
                 # Market scan every 5 minutes
                 await self.scan_markets()
                 
-                # NEW: Check active trades every 30 seconds
+                # Check active trades every 30 seconds
                 time_since_trade_check = (datetime.now() - self.last_trade_check).total_seconds()
                 if time_since_trade_check >= trade_check_interval:
                     await self.monitor_trades()
@@ -189,7 +206,7 @@ class NixieTradingBot:
                     await self.send_hourly_update()
                     self.last_hourly_update = datetime.now()
                 
-                # Sleep for remaining time in interval (use smallest interval)
+                # Sleep for remaining time
                 elapsed = time.time() - loop_start
                 sleep_time = max(0, min(scan_interval, trade_check_interval) - elapsed)
                 
@@ -220,7 +237,12 @@ class NixieTradingBot:
                     if not market_state:
                         continue
                     
-                    # Generate signal if conditions met (WITH DUPLICATE PREVENTION)
+                    # Check news blackout
+                    if self.news_service and self.news_service.is_news_blackout_period():
+                        logger.info(f"Signal generation paused: News blackout period")
+                        continue
+                    
+                    # Generate signal if conditions met
                     signal = await self.signal_generator.generate_signal(symbol, market_state)
                     
                     if signal:
@@ -230,7 +252,7 @@ class NixieTradingBot:
                         # Store signal for ML training
                         await self.ml_engine.store_signal(signal)
                         
-                        # NEW: Execute on user accounts if they have auto-execution enabled
+                        # Execute on user accounts if enabled
                         if hasattr(self.telegram_handler, 'account_manager'):
                             execution_results = await self.telegram_handler.execute_signal_for_users(signal)
                             if execution_results:
@@ -243,7 +265,7 @@ class NixieTradingBot:
                     logger.error(f"Error scanning {symbol}: {e}")
                     print(Fore.RED + f"[ERROR] Scanning {symbol}: {e}")
             
-            # NEW: Display active signals count
+            # Display active signals count
             active_count = self.signal_generator.get_active_signals_count()
             print(Fore.CYAN + f"[SCAN] Market scan completed | Active signals: {active_count}")
             
@@ -251,7 +273,7 @@ class NixieTradingBot:
             logger.error(f"Error in market scan: {e}", exc_info=True)
     
     async def monitor_trades(self):
-        """NEW: Monitor active trades for TP/SL hits"""
+        """Monitor active trades for TP/SL hits"""
         try:
             # Check for TP/SL hits
             notifications = await self.signal_generator.check_active_signals()
@@ -281,7 +303,7 @@ class NixieTradingBot:
                     logger.error(f"Error getting update for {symbol}: {e}")
             
             if updates:
-                # NEW: Include win rate stats
+                # Include win rate stats
                 win_rate_stats = self.signal_generator.get_win_rate()
                 message = self._format_hourly_message(updates, win_rate_stats)
                 await self.telegram_handler.broadcast_message(message)
@@ -292,7 +314,6 @@ class NixieTradingBot:
     
     def _format_startup_message(self):
         """Format bot startup notification"""
-        # NEW: Include account stats if available
         account_info = ""
         if hasattr(self.telegram_handler, 'account_manager'):
             try:
@@ -305,6 +326,16 @@ class NixieTradingBot:
 """
             except:
                 pass
+        
+        news_info = ""
+        if self.news_service:
+            news_info = """
+<b>News Service:</b>
+- Daily reports: 8 AM (your timezone)
+- 10-min reminders before events
+- Live notifications with predictions
+- Auto timezone detection: Enabled
+"""
         
         return f"""
 <b>NIXIE'S TRADING BOT - SYSTEM ONLINE</b>
@@ -320,12 +351,15 @@ class NixieTradingBot:
 - Update Interval: 1 hour
 - ML Engine: Enabled
 - Strategy: SMC Institutional Precision
-{account_info}
+{account_info}{news_info}
 <b>NEW FEATURES:</b>
 ✓ Duplicate signal prevention
 ✓ Auto CSV export
 ✓ TP/SL monitoring & notifications
 ✓ Multi-user account management
+✓ Daily news reports (8 AM)
+✓ Auto timezone detection
+✓ News trading control
 ✓ Accurate win rate tracking
 
 <b>System Message:</b>
@@ -351,7 +385,7 @@ Market updates will be sent hourly if no signals are generated.
         message = f"<b>HOURLY MARKET UPDATE</b>\n"
         message += f"<b>Time:</b> {timestamp}\n\n"
         
-        # NEW: Performance stats
+        # Performance stats
         message += f"<b>📊 Bot Performance:</b>\n"
         message += f"Win Rate: {win_rate_stats['win_rate']:.1f}%\n"
         message += f"Trades: {win_rate_stats['wins']}W / {win_rate_stats['losses']}L\n"
@@ -398,6 +432,10 @@ The bot has been shut down. No further signals or updates will be sent until res
                     logger.error(f"Failed to send shutdown notification: {e}")
                 
                 await self.telegram_handler.shutdown()
+            
+            # Stop news service
+            if self.news_service:
+                self.news_service.stop()
             
             # Disconnect MT5
             if self.mt5_connection:

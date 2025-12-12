@@ -14,16 +14,28 @@ class Config:
     # MT5 Configuration (Exness Broker)
     MT5_LOGIN = int(os.getenv('MT5_LOGIN', '0'))
     MT5_PASSWORD = os.getenv('MT5_PASSWORD', '')
-    MT5_SERVER = os.getenv('MT5_SERVER', 'Exness-MT5Trial9')  # Exness server
+    MT5_SERVER = os.getenv('MT5_SERVER', 'Exness-MT5Trial9')
     MT5_TIMEOUT = int(os.getenv('MT5_TIMEOUT', '60000'))
     
     # Telegram Configuration
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_ADMIN_ID = os.getenv('TELEGRAM_ADMIN_ID', '')
     
-    # AUTO-EXECUTION TOGGLE (NEW FEATURE)
-    # Set to 'true' or 'false' in .env file
+    # AUTO-EXECUTION TOGGLE
     AUTO_EXECUTE_TRADES = os.getenv('AUTO_EXECUTE_TRADES', 'false').lower() == 'true'
+    
+    # News Settings (NEW)
+    NEWS_SCHEDULE_TIME = "08:00"
+    NEWS_REMINDER_MINUTES = 10
+    RED_FOLDER_IMPACTS = ["High", "Medium"]
+    
+    # Trading Control (NEW)
+    ALLOW_TRADING_DURING_NEWS = False
+    NEWS_BLACKOUT_MINUTES_BEFORE = 15
+    NEWS_BLACKOUT_MINUTES_AFTER = 15
+    
+    # Timezone Settings (NEW)
+    DEFAULT_TIMEZONE = "UTC"
     
     # Trading Symbols (Exness notation)
     TRADING_SYMBOLS = [
@@ -32,26 +44,26 @@ class Config:
         # Forex Crosses
         'EURJPYm', 'GBPJPYm', 'EURGBPm', 'EURAUDm', 'EURCADm', 'GBPAUDm', 'GBPCADm',
         # Metals
-        'XAUUSDm', 'XAGUSDm',  # Gold and Silver
+        'XAUUSDm', 'XAGUSDm',
         # Indices
         'US30m', 'USTECm', 'US500m', 'UK100m', 'DE30m', 'JP225m',
-        #Crypto
+        # Crypto
         'BTCUSDm'
     ]
     
-    # Risk Management (based on document requirements)
-    MAX_RISK_PERCENT = 2.0  # 2% per trade (non-negotiable)
-    MIN_RISK_REWARD = 3.0  # Minimum 1:3 R:R
-    TARGET_WIN_RATE = 65.0  # Target win rate percentage
-    MAX_DAILY_DRAWDOWN = 4.0  # Maximum daily drawdown %
-    MAX_WEEKLY_DRAWDOWN = 8.0  # Maximum weekly drawdown %
+    # Risk Management
+    MAX_RISK_PERCENT = 2.0
+    MIN_RISK_REWARD = 3.0
+    TARGET_WIN_RATE = 65.0
+    MAX_DAILY_DRAWDOWN = 4.0
+    MAX_WEEKLY_DRAWDOWN = 8.0
     
     # Strategy Parameters (SMC)
     TIMEFRAMES = {
-        'HTF': '240',  # H4 for higher timeframe analysis
-        'MTF': '60',   # H1 for intermediate
-        'LTF_ENTRY': '15',   # M5 for entry confirmation
-        'LTF_PRECISION': '5'  # M1 for precision entry
+        'HTF': '240',
+        'MTF': '60',
+        'LTF_ENTRY': '15',
+        'LTF_PRECISION': '5'
     }
     
     # Kill Zones (UTC time)
@@ -60,13 +72,13 @@ class Config:
     LONDON_NY_OVERLAP = {'start': '13:00', 'end': '12:00'}
     
     # Technical Parameters
-    FVG_MIN_SIZE = 5  # Minimum FVG size in pips
-    OB_LOOKBACK = 20  # Candles to look back for Order Blocks
-    LIQUIDITY_THRESHOLD = 10  # Minimum pip distance for liquidity levels
-    DISPLACEMENT_MIN_SIZE = 15  # Minimum displacement in pips
+    FVG_MIN_SIZE = 5
+    OB_LOOKBACK = 20
+    LIQUIDITY_THRESHOLD = 10
+    DISPLACEMENT_MIN_SIZE = 15
     
     # ML Configuration
-    ML_TRAINING_THRESHOLD = 20  # Train after this many signals
+    ML_TRAINING_THRESHOLD = 20
     ML_MODEL_PATH = 'models/ml_model.pkl'
     ML_SCALER_PATH = 'models/scaler.pkl'
     ML_FEATURES = [
@@ -85,16 +97,16 @@ class Config:
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
     LOG_FILE = 'logs/nixie_bot.log'
     
-    # Performance Targets (from document)
-    WEEKLY_TARGET_RETURN = 30.0  # 30% weekly target
-    MAX_SPREAD_COST = 0.5  # Maximum acceptable spread in pips
+    # Performance Targets
+    WEEKLY_TARGET_RETURN = 30.0
+    MAX_SPREAD_COST = 0.5
     
     # Notification Settings
     HOURLY_UPDATE_ENABLED = True
-    SIGNAL_COOLDOWN = 300  # 5 minutes between signals for same symbol
+    SIGNAL_COOLDOWN = 300
     
     # Trade Monitoring
-    CHECK_TRADES_INTERVAL = 30  # Check every 30 seconds for TP/SL hits
+    CHECK_TRADES_INTERVAL = 30
     
     @classmethod
     def validate(cls):
@@ -115,7 +127,6 @@ class Config:
     @classmethod
     def get_symbol_info(cls, symbol):
         """Get symbol-specific information for Exness"""
-        # Exness-specific symbol configurations
         symbol_configs = {
             'XAUUSDm': {
                 'point_value': 0.01,
@@ -137,7 +148,6 @@ class Config:
             }
         }
         
-        # Default configuration for symbols not explicitly defined
         default_config = {
             'point_value': 0.0001,
             'typical_spread': 1.0,

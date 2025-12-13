@@ -22,9 +22,7 @@ class NewsService:
         self.scheduler = BackgroundScheduler(timezone=pytz.UTC)
         self.news_cache = []
         self.last_fetch = None
-        self.notified_events = set()  # Track notified events to avoid duplicates
-        
-        # ForexFactory News API
+        self.notified_events = set()
         self.api_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
         
     def start(self):
@@ -34,7 +32,8 @@ class NewsService:
             self.scheduler.add_job(
                 self.send_daily_news_report,
                 CronTrigger(hour=8, minute=0),
-                id='daily_news_report'
+                id='daily_news_report',
+                misfire_grace_time=3600  # Allow 1 hour grace period
             )
             
             # Check for upcoming news every 5 minutes
@@ -42,7 +41,8 @@ class NewsService:
                 self.check_upcoming_news,
                 'interval',
                 minutes=5,
-                id='news_reminder'
+                id='news_reminder',
+                misfire_grace_time=300  # 5 minute grace period
             )
             
             # Fetch news every hour
@@ -50,7 +50,8 @@ class NewsService:
                 self.fetch_news,
                 'interval',
                 hours=1,
-                id='news_fetch'
+                id='news_fetch',
+                misfire_grace_time=1800  # 30 minute grace period
             )
             
             self.scheduler.start()
@@ -85,22 +86,17 @@ class NewsService:
         
         for event in raw_news:
             try:
-                # Only include high/medium impact news
                 impact = event.get('impact', '').lower()
                 if impact not in ['high', 'medium']:
                     continue
                 
-                # Parse datetime
                 date_str = event.get('date', '')
                 time_str = event.get('time', '')
                 
                 if not date_str or not time_str:
                     continue
                 
-                event_dt = datetime.strptime(
-                    f"{date_str} {time_str}", 
-                    "%Y-%m-%d %H:%M"
-                )
+                event_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
                 event_dt = pytz.UTC.localize(event_dt)
                 
                 parsed_news.append({
@@ -142,14 +138,23 @@ class NewsService:
     def send_daily_news_report(self):
         """Send daily news report at 8 AM"""
         try:
-            # Get subscribers from telegram handler
-            subscribers = self.telegram.get_all_subscribers()
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._async_send_daily_report())
+            loop.close()
+        except Exception as e:
+            logger.error(f"Error sending daily news report: {e}")
+    
+    async def _async_send_daily_report(self):
+        """Async daily report sender"""
+        try:
+            subscribers = await self.telegram._async_get_all_subscribers()
             
             for subscriber in subscribers:
                 user_id = subscriber['user_id']
                 timezone = subscriber.get('timezone', 'UTC')
                 
-                # Check if it's 8 AM in user's timezone
                 user_tz = pytz.timezone(timezone)
                 user_time = datetime.now(user_tz)
                 
@@ -159,8 +164,7 @@ class NewsService:
                 news = self.get_todays_red_folder_news(timezone)
                 
                 if not news:
-                    message = "📰 *Daily News Report*\n\n"
-                    message += "No high-impact news scheduled for today. ✅"
+                    message = "📰 *Daily News Report*\n\nNo high-impact news scheduled for today. ✅"
                 else:
                     message = "🚨 *Daily Red Folder News Report*\n\n"
                     message += f"📅 {user_time.strftime('%A, %B %d, %Y')}\n\n"
@@ -174,46 +178,50 @@ class NewsService:
                     
                     message += "\n💡 You'll receive reminders 10 minutes before each event."
                 
-                self.telegram.send_message(user_id, message)
+                await self.telegram._async_send_message(user_id, message)
                 
             logger.info(f"Sent daily news report to {len(subscribers)} subscribers")
-            
         except Exception as e:
-            logger.error(f"Error sending daily news report: {e}")
+            logger.error(f"Error in async daily report: {e}")
     
     def check_upcoming_news(self):
         """Check for news events in the next 10 minutes"""
         try:
-            now = datetime.now(pytz.UTC)
-            reminder_time = now + timedelta(minutes=10)
-            
-            for news in self.news_cache:
-                time_diff = (news['datetime'] - now).total_seconds() / 60
-                
-                # Create unique event ID
-                event_id = f"{news['title']}_{news['datetime'].isoformat()}"
-                
-                # Send reminder if news is 10 minutes away (±2 min window)
-                if 8 <= time_diff <= 12:
-                    reminder_id = f"reminder_{event_id}"
-                    if reminder_id not in self.notified_events:
-                        self._send_news_reminder(news)
-                        self.notified_events.add(reminder_id)
-                
-                # Send live notification if news is happening now (±2 min window)
-                if -2 <= time_diff <= 2:
-                    live_id = f"live_{event_id}"
-                    if live_id not in self.notified_events:
-                        self._send_live_news_notification(news)
-                        self.notified_events.add(live_id)
-                    
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._async_check_news())
+            loop.close()
         except Exception as e:
             logger.error(f"Error checking upcoming news: {e}")
     
-    def _send_news_reminder(self, news: Dict):
+    async def _async_check_news(self):
+        """Async news checker"""
+        try:
+            now = datetime.now(pytz.UTC)
+            
+            for news in self.news_cache:
+                time_diff = (news['datetime'] - now).total_seconds() / 60
+                event_id = f"{news['title']}_{news['datetime'].isoformat()}"
+                
+                if 8 <= time_diff <= 12:
+                    reminder_id = f"reminder_{event_id}"
+                    if reminder_id not in self.notified_events:
+                        await self._send_news_reminder(news)
+                        self.notified_events.add(reminder_id)
+                
+                if -2 <= time_diff <= 2:
+                    live_id = f"live_{event_id}"
+                    if live_id not in self.notified_events:
+                        await self._send_live_news_notification(news)
+                        self.notified_events.add(live_id)
+        except Exception as e:
+            logger.error(f"Error in async check news: {e}")
+    
+    async def _send_news_reminder(self, news: Dict):
         """Send 10-minute reminder"""
         try:
-            subscribers = self.telegram.get_all_subscribers()
+            subscribers = await self.telegram._async_get_all_subscribers()
             
             for subscriber in subscribers:
                 timezone = subscriber.get('timezone', 'UTC')
@@ -227,22 +235,18 @@ class NewsService:
                 message += f"📈 Previous: {news['previous']}\n\n"
                 message += "⚠️ Trading may be volatile. Use caution!"
                 
-                self.telegram.send_message(subscriber['user_id'], message)
+                await self.telegram._async_send_message(subscriber['user_id'], message)
                 
             logger.info(f"Sent news reminder: {news['title']}")
-                
         except Exception as e:
             logger.error(f"Error sending news reminder: {e}")
     
-    def _send_live_news_notification(self, news: Dict):
+    async def _send_live_news_notification(self, news: Dict):
         """Send live news notification"""
         try:
-            subscribers = self.telegram.get_all_subscribers()
-            
-            # Fetch latest data for actual values
+            subscribers = await self.telegram._async_get_all_subscribers()
             self.fetch_news()
             
-            # Find updated news
             updated_news = next(
                 (n for n in self.news_cache if n['title'] == news['title'] 
                  and n['datetime'] == news['datetime']), 
@@ -251,8 +255,6 @@ class NewsService:
             
             actual = updated_news.get('actual', 'Pending...')
             forecast = updated_news['forecast']
-            
-            # Determine prediction vs outcome
             prediction = self._analyze_prediction(forecast, actual)
             
             for subscriber in subscribers:
@@ -265,10 +267,9 @@ class NewsService:
                 message += f"*Prediction: {prediction}*\n\n"
                 message += "⚠️ High volatility expected!"
                 
-                self.telegram.send_message(subscriber['user_id'], message)
+                await self.telegram._async_send_message(subscriber['user_id'], message)
                 
             logger.info(f"Sent live news notification: {updated_news['title']}")
-                
         except Exception as e:
             logger.error(f"Error sending live news notification: {e}")
     
@@ -278,7 +279,6 @@ class NewsService:
             if actual == 'Pending...' or actual == 'N/A':
                 return "⏳ Data pending"
             
-            # Try to convert to numbers for comparison
             forecast_val = float(forecast.replace('%', '').replace('K', '000').replace('M', '000000').replace('B', '000000000'))
             actual_val = float(actual.replace('%', '').replace('K', '000').replace('M', '000000').replace('B', '000000000'))
             
@@ -288,7 +288,6 @@ class NewsService:
                 return "📉 WORSE than forecast (Bearish)"
             else:
                 return "➡️ IN LINE with forecast (Neutral)"
-                
         except:
             return "❓ Unable to compare"
     
@@ -311,13 +310,11 @@ class NewsService:
                 
                 time_diff = (news['datetime'] - now).total_seconds() / 60
                 
-                # Check if within blackout window
                 if -blackout_after <= time_diff <= blackout_before:
                     logger.info(f"News blackout active: {news['title']} in {time_diff:.1f} minutes")
                     return True
             
             return False
-            
         except Exception as e:
             logger.error(f"Error checking news blackout: {e}")
             return False
@@ -326,7 +323,7 @@ class NewsService:
         """Stop the news service"""
         try:
             if self.scheduler.running:
-                self.scheduler.shutdown()
+                self.scheduler.shutdown(wait=False)  # Don't wait for jobs to complete
                 logger.info("News service stopped")
         except Exception as e:
             logger.error(f"Error stopping news service: {e}")
